@@ -34,15 +34,17 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
             }
         }
         syn_verus::Expr::Path(p) => {
-            // Collect each segment of the path: e.g. `Foo::bar` -> "Foo", "bar", "Foo::bar"
+            // For bare paths like `bar`, collect "bar".
+            // For qualified paths like `Foo::bar`, collect only "Foo::bar"
+            // so later bare-name resolution does not also treat the qualified
+            // reference as a separate bare `bar` reference.
             let segments: Vec<String> = p.path.segments.iter()
                 .map(|s| s.ident.to_string())
                 .collect();
-            for s in &segments {
-                out.insert(s.clone());
-            }
             if segments.len() > 1 {
                 out.insert(segments.join("::"));
+            } else if let Some(segment) = segments.first() {
+                out.insert(segment.clone());
             }
         }
         syn_verus::Expr::Binary(b) => {
@@ -80,9 +82,24 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
             for stmt in &w.body.stmts {
                 collect_idents_stmt(stmt, out);
             }
-            // Also check invariants
+            // Also check loop spec clauses
             if let Some(ref inv) = w.invariant {
                 for expr in &inv.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref inv) = w.invariant_ensures {
+                for expr in &inv.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref inv) = w.invariant_except_break {
+                for expr in &inv.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref dec) = w.decreases {
+                for expr in &dec.exprs.exprs {
                     collect_idents_expr(expr, out);
                 }
             }
@@ -97,6 +114,11 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
                     collect_idents_expr(expr, out);
                 }
             }
+            if let Some(ref dec) = fl.decreases {
+                for expr in &dec.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
         }
         syn_verus::Expr::Loop(l) => {
             for stmt in &l.body.stmts {
@@ -104,6 +126,21 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
             }
             if let Some(ref inv) = l.invariant {
                 for expr in &inv.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref inv) = l.invariant_ensures {
+                for expr in &inv.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref inv) = l.invariant_except_break {
+                for expr in &inv.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref dec) = l.decreases {
+                for expr in &dec.exprs.exprs {
                     collect_idents_expr(expr, out);
                 }
             }
@@ -369,8 +406,8 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
 
 /// Parse a Verus file and compute dependency map.
 ///
-/// Returns a list of FnDependency records for each proof_fn and spec_fn,
-/// showing which other spec_fns (defined in this file) each one references.
+/// Returns a list of FnDependency records for every function in the file,
+/// showing which spec_fns (defined in this file) each one references.
 pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
     fextract_verus_macro(filepath).map(|(files, _)| {
         let mut fn_infos: Vec<FnInfo> = Vec::new();
@@ -395,13 +432,13 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
         // For each function, resolve which spec_fns it references
         let mut deps = Vec::new();
         for info in &fn_infos {
-            let mut depends_on: Vec<String> = Vec::new();
+            let mut dep_set: HashSet<String> = HashSet::new();
 
             // Check each referenced ident against known spec_fn names
             for ident in &info.referenced_idents {
                 // Direct qualified match: ident is "Foo::bar" and that's a known spec_fn
                 if spec_qualified.contains(ident) && *ident != info.name {
-                    depends_on.push(ident.clone());
+                    dep_set.insert(ident.clone());
                     continue;
                 }
                 // Bare name match: ident is "bar" and there are spec_fns with that bare name.
@@ -419,15 +456,15 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                         qualified_list.iter().collect()
                     };
                     for q in candidates {
-                        if *q != info.name && !depends_on.contains(q) {
-                            depends_on.push(q.clone());
+                        if *q != info.name {
+                            dep_set.insert(q.clone());
                         }
                     }
                 }
             }
 
+            let mut depends_on: Vec<String> = dep_set.into_iter().collect();
             depends_on.sort();
-            depends_on.dedup();
 
             deps.push(FnDependency {
                 name: info.name.clone(),

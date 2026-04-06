@@ -193,6 +193,10 @@ lynette deps -j -f proof_fn --non-empty file.rs
 4. For qualified references (e.g. `Foo::bar`), matches directly. For bare names (e.g. `bar`), applies a **same-impl preference heuristic**: if the calling function is inside `impl Foo`, only `Foo::bar` is matched; otherwise all spec_fns with that bare name are included
 5. Reports matches using qualified names (e.g. `Foo::bar`) when available, or bare names (e.g. `bar`) otherwise
 
+### Scope
+
+The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, `spec_fn`, `default_fn`, etc.). The dependency targets (`depends_on`) are limited to **`spec_fn` and `spec_checked_fn`** defined in the same file — other function-to-function references (e.g. `proof_fn` → `proof_fn`) are not tracked. The `--filter` flag controls which source functions to *display*, not what is detected as a dependency target.
+
 ### Limitations
 
 - Only detects references to `spec_fn`s defined **in the same file** — cross-file dependencies are not tracked.
