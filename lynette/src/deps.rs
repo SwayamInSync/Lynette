@@ -215,13 +215,9 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
             }
         }
         syn_verus::Expr::Struct(s) => {
-            // Collect only the fully-qualified struct path to avoid
-            // introducing false positives from individual path segments.
-            let path = s.path.segments.iter()
-                .map(|seg| seg.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            out.insert(path);
+            // Do not collect the struct constructor path: struct construction
+            // is not a function call, and inserting the type path would create
+            // false dependencies when a type name matches a spec_fn name.
             for field in &s.fields {
                 collect_idents_expr(&field.expr, out);
             }
@@ -284,20 +280,10 @@ fn collect_idents_stmt(stmt: &syn_verus::Stmt, out: &mut HashSet<String>) {
                 collect_idents_expr(&init.expr, out);
             }
         }
-        syn_verus::Stmt::Item(i) => collect_idents_item(i, out),
+        // Do not descend into nested items: identifiers referenced inside
+        // a nested `fn` belong to that nested item, not the enclosing function.
+        syn_verus::Stmt::Item(_) => {}
         syn_verus::Stmt::Macro(_) => {}
-    }
-}
-
-fn collect_idents_item(item: &syn_verus::Item, out: &mut HashSet<String>) {
-    match item {
-        syn_verus::Item::Fn(f) => {
-            collect_idents_sig(&f.sig, out);
-            for stmt in &f.block.stmts {
-                collect_idents_stmt(stmt, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -366,19 +352,11 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             if impl_name.is_empty() {
                 return;
             }
-            // For trait impls, use `<Self as Trait>` to match list_segments naming
-            let qualified_name = if let Some((_, ref trait_path, _)) = i.trait_ {
-                let trait_name = trait_path.segments.iter()
-                    .map(|s| s.ident.to_string())
-                    .collect::<Vec<_>>()
-                    .join("::");
-                format!("<{} as {}>", impl_name, trait_name)
-            } else {
-                impl_name.clone()
-            };
+            // Name impl methods as `Type::method` (matching list_segments),
+            // regardless of whether this is a trait impl or inherent impl.
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
-                    let fn_name = format!("{}::{}", qualified_name, m.sig.ident);
+                    let fn_name = format!("{}::{}", impl_name, m.sig.ident);
                     let kind = fn_mode_to_kind(&m.sig.mode);
 
                     let mut idents = HashSet::new();
@@ -467,12 +445,13 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                     dep_set.insert(ident.clone());
                     continue;
                 }
-                // For Rust path prefixes (crate::, self::, super::) that don't
-                // directly match a known spec_fn, fall back to the bare last
-                // segment for resolution. Other qualified paths (e.g. Foo::bar)
-                // that didn't match are left as-is — they were already checked
-                // against spec_qualified above.
-                let resolved_ident = if ident.starts_with("crate::") || ident.starts_with("self::") || ident.starts_with("super::") {
+                // For Rust path prefixes (crate::, self::, super::, Self::)
+                // that don't directly match a known spec_fn, fall back to the
+                // bare last segment for resolution. `Self::method` is common in
+                // impl blocks and must be resolved via the same-impl heuristic.
+                // Other qualified paths (e.g. Foo::bar) that didn't match are
+                // left as-is — they were already checked against spec_qualified.
+                let resolved_ident = if ident.starts_with("crate::") || ident.starts_with("self::") || ident.starts_with("super::") || ident.starts_with("Self::") {
                     ident.rsplit("::").next().unwrap_or(ident)
                 } else {
                     ident.as_str()
