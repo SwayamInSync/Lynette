@@ -2,7 +2,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::list_segments::SegmentKind;
+use crate::list_segments::{fn_mode_to_kind, SegmentKind};
 use crate::utils::*;
 
 /// A dependency record: a function and the spec_fns it references.
@@ -320,7 +320,8 @@ struct FnInfo {
     referenced_idents: HashSet<String>,
 }
 
-/// Walk a top-level item and collect FnInfo for each spec_fn / proof_fn.
+/// Walk a top-level item and collect `FnInfo` for each function definition
+/// (all kinds: spec, spec-checked, proof, proof-axiom, exec, and default).
 fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInfo>) {
     match item {
         syn_verus::Item::Fn(f) => {
@@ -329,14 +330,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             } else {
                 format!("{}::{}", namespace, f.sig.ident)
             };
-            let kind = match f.sig.mode {
-                syn_verus::FnMode::Spec(_) => SegmentKind::SpecFn,
-                syn_verus::FnMode::SpecChecked(_) => SegmentKind::SpecCheckedFn,
-                syn_verus::FnMode::Proof(_) => SegmentKind::ProofFn,
-                syn_verus::FnMode::ProofAxiom(_) => SegmentKind::ProofAxiomFn,
-                syn_verus::FnMode::Exec(_) => SegmentKind::ExecFn,
-                syn_verus::FnMode::Default => SegmentKind::DefaultFn,
-            };
+            let kind = fn_mode_to_kind(&f.sig.mode);
 
             let mut idents = HashSet::new();
             collect_idents_sig(&f.sig, &mut idents);
@@ -355,14 +349,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
                     let fn_name = format!("{}::{}", impl_name, m.sig.ident);
-                    let kind = match m.sig.mode {
-                        syn_verus::FnMode::Spec(_) => SegmentKind::SpecFn,
-                        syn_verus::FnMode::SpecChecked(_) => SegmentKind::SpecCheckedFn,
-                        syn_verus::FnMode::Proof(_) => SegmentKind::ProofFn,
-                        syn_verus::FnMode::ProofAxiom(_) => SegmentKind::ProofAxiomFn,
-                        syn_verus::FnMode::Exec(_) => SegmentKind::ExecFn,
-                        syn_verus::FnMode::Default => SegmentKind::DefaultFn,
-                    };
+                    let kind = fn_mode_to_kind(&m.sig.mode);
 
                     let mut idents = HashSet::new();
                     collect_idents_sig(&m.sig, &mut idents);
@@ -383,14 +370,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             for ti in &t.items {
                 if let syn_verus::TraitItem::Fn(m) = ti {
                     let fn_name = format!("{}::{}", trait_name, m.sig.ident);
-                    let kind = match m.sig.mode {
-                        syn_verus::FnMode::Spec(_) => SegmentKind::SpecFn,
-                        syn_verus::FnMode::SpecChecked(_) => SegmentKind::SpecCheckedFn,
-                        syn_verus::FnMode::Proof(_) => SegmentKind::ProofFn,
-                        syn_verus::FnMode::ProofAxiom(_) => SegmentKind::ProofAxiomFn,
-                        syn_verus::FnMode::Exec(_) => SegmentKind::ExecFn,
-                        syn_verus::FnMode::Default => SegmentKind::DefaultFn,
-                    };
+                    let kind = fn_mode_to_kind(&m.sig.mode);
 
                     let mut idents = HashSet::new();
                     collect_idents_sig(&m.sig, &mut idents);
@@ -519,12 +499,13 @@ pub fn print_deps_json(deps: &[FnDependency]) {
 /// Print dependency results as human-readable text.
 pub fn print_deps_text(deps: &[FnDependency]) {
     for dep in deps {
-        if dep.depends_on.is_empty() {
-            continue;
-        }
         println!("{} ({}):", dep.name, dep.kind.label());
-        for d in &dep.depends_on {
-            println!("  -> {}", d);
+        if dep.depends_on.is_empty() {
+            println!("  (none)");
+        } else {
+            for d in &dep.depends_on {
+                println!("  -> {}", d);
+            }
         }
     }
 }

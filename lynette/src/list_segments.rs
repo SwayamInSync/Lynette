@@ -73,7 +73,7 @@ impl SegmentKind {
     }
 }
 
-fn fn_mode_to_kind(mode: &syn_verus::FnMode) -> SegmentKind {
+pub fn fn_mode_to_kind(mode: &syn_verus::FnMode) -> SegmentKind {
     match mode {
         syn_verus::FnMode::Spec(_) => SegmentKind::SpecFn,
         syn_verus::FnMode::SpecChecked(_) => SegmentKind::SpecCheckedFn,

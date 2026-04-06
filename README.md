@@ -154,9 +154,12 @@ lynette deps [OPTIONS] <FILE>
 function_name (kind):
   -> dependency1
   -> dependency2
+
+function_with_no_deps (kind):
+  (none)
 ```
 
-Only functions with dependencies are shown in text mode.
+All functions are shown by default; use `--non-empty` to hide functions with zero dependencies.
 
 **JSON (`-j`):**
 ```json
