@@ -187,7 +187,7 @@ lynette deps -j -f proof_fn --non-empty file.rs
 
 ### How It Works
 
-1. Parses the file with `syn_verus` and collects all function definitions (free functions, impl methods, trait methods)
+1. Parses the file with `syn_verus` and collects all function definitions (free functions, impl methods, trait methods, and functions inside inline modules)
 2. For each function, walks the AST of its body and signature spec clauses to collect all referenced identifiers (function calls, method calls, path references)
 3. Cross-references those identifiers against the set of `spec_fn` / `spec(checked)` functions defined in the same file
 4. For qualified references (e.g. `Foo::bar`), matches directly. For bare names (e.g. `bar`), applies a **same-impl preference heuristic**: if the calling function is inside `impl Foo`, only `Foo::bar` is matched; otherwise all spec_fns with that bare name are included

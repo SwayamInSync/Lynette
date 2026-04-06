@@ -195,13 +195,13 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
             }
         }
         syn_verus::Expr::Struct(s) => {
-            // Collect the struct path
-            let segments: Vec<String> = s.path.segments.iter()
+            // Collect only the fully-qualified struct path to avoid
+            // introducing false positives from individual path segments.
+            let path = s.path.segments.iter()
                 .map(|seg| seg.ident.to_string())
-                .collect();
-            for seg in &segments {
-                out.insert(seg.clone());
-            }
+                .collect::<Vec<_>>()
+                .join("::");
+            out.insert(path);
             for field in &s.fields {
                 collect_idents_expr(&field.expr, out);
             }
@@ -348,6 +348,10 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
         }
         syn_verus::Item::Impl(i) => {
             let impl_name = type_path_to_string(&i.self_ty);
+            // Skip impls where we can't extract the type name (e.g. `impl Trait for &Foo`)
+            if impl_name.is_empty() {
+                return;
+            }
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
                     let fn_name = format!("{}::{}", impl_name, m.sig.ident);
@@ -400,6 +404,18 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
                 }
             }
         }
+        syn_verus::Item::Mod(m) => {
+            let mod_name = if namespace.is_empty() {
+                m.ident.to_string()
+            } else {
+                format!("{}::{}", namespace, m.ident)
+            };
+            if let Some((_, ref items)) = m.content {
+                for item in items {
+                    collect_fn_infos(item, &mod_name, out);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -441,11 +457,19 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                     dep_set.insert(ident.clone());
                     continue;
                 }
+                // For module-qualified paths (e.g. `crate::my_spec`, `m::spec1`) that
+                // don't directly match, fall back to the bare last segment so we can
+                // still resolve against known spec_fns.
+                let resolved_ident = if ident.contains("::") {
+                    ident.rsplit("::").next().unwrap_or(ident)
+                } else {
+                    ident.as_str()
+                };
                 // Bare name match: ident is "bar" and there are spec_fns with that bare name.
                 // Heuristic: if the calling function is inside `impl Foo`, prefer
                 // `Foo::bar` over other `Type::bar` candidates. Only fall back to
                 // all candidates when none share the same impl type.
-                if let Some(qualified_list) = spec_by_bare.get(ident) {
+                if let Some(qualified_list) = spec_by_bare.get(resolved_ident) {
                     let candidates: Vec<&String> = if let Some(ref impl_ty) = info.impl_type {
                         let prefix = format!("{}::", impl_ty);
                         let same_impl: Vec<&String> = qualified_list.iter()
