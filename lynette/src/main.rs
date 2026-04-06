@@ -12,6 +12,7 @@ mod additions;
 mod benchmark_gen;
 mod code;
 mod deghost;
+mod deps;
 mod func;
 mod list_segments;
 //mod merge;
@@ -22,6 +23,7 @@ use crate::additions::*;
 use crate::benchmark_gen::*;
 use crate::code::*;
 use crate::deghost::*;
+use crate::deps::*;
 use crate::func::*;
 use crate::list_segments::*;
 //use crate::merge::*;
@@ -442,6 +444,31 @@ struct ListArgs {
     filter: Option<Vec<String>>,
 }
 
+#[derive(Args)]
+struct DepsArgs {
+    file: PathBuf,
+    #[clap(
+        short,
+        long,
+        help = "Output in JSON format instead of text.",
+        default_value = "false"
+    )]
+    json: bool,
+    #[clap(
+        short,
+        long,
+        help = "Filter source functions by kind (e.g. proof_fn,spec_fn). Only show deps for these kinds. Comma-separated.",
+        value_delimiter = ','
+    )]
+    filter: Option<Vec<String>>,
+    #[clap(
+        long,
+        help = "Only show functions that have at least one dependency.",
+        default_value = "false"
+    )]
+    non_empty: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     #[clap(about = r#"Compare whether two verus source code files generates the same rust code.
@@ -466,6 +493,14 @@ Example output:
   requires:entails_trans:((69, 8), (69, 20))
 "#)]
     List(ListArgs),
+    #[clap(about = r#"Compute dependencies between functions in a Verus file.
+
+For each function (proof_fn, spec_fn, etc.), reports which spec_fns defined in the
+same file it references, based on AST-level identifier analysis.
+
+Output includes the function name, kind, and a list of spec_fn dependencies.
+"#)]
+    Deps(DepsArgs),
 }
 
 #[derive(ClapParser)]
@@ -967,6 +1002,32 @@ fn main() {
                 print_segments_json(&segments);
             } else {
                 print_segments_text(&segments);
+            }
+        }
+        Commands::Deps(args) => {
+            let deps = fcompute_deps(&args.file).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                process::exit(1);
+            });
+
+            let deps: Vec<_> = if let Some(ref filters) = args.filter {
+                deps.into_iter()
+                    .filter(|dep| filters.iter().any(|f| f == dep.kind.label()))
+                    .collect()
+            } else {
+                deps
+            };
+
+            let deps: Vec<_> = if args.non_empty {
+                deps.into_iter().filter(|dep| !dep.depends_on.is_empty()).collect()
+            } else {
+                deps
+            };
+
+            if args.json {
+                print_deps_json(&deps);
+            } else {
+                print_deps_text(&deps);
             }
         }
     };

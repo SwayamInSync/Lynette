@@ -19,6 +19,7 @@ lynette <COMMAND>
 
 Commands:
   list        List all Verus segments with types, names, and locations
+  deps        Compute function dependencies (which spec_fns each function references)
   compare     Compare two Verus files (ignoring ghost code by default)
   parse       Parse and validate Verus syntax
   func        Operations on individual functions
@@ -127,6 +128,91 @@ spec_fn:ConfigMapView::_default             (method in impl ConfigMapView)
 proof_fn:Cluster::lemma_always_...          (method in impl Cluster)
 spec_fn:owner_reference_to_object_reference (free function)
 ```
+
+---
+
+## `lynette deps` — Compute Function Dependencies
+
+**Added command.** Performs AST-level dependency analysis on a Verus source file. For each function, reports which `spec_fn`s (defined in the same file) it references — by walking the function's body and signature spec clauses (requires, ensures, recommends, decreases) and collecting all referenced identifiers.
+
+```bash
+lynette deps [OPTIONS] <FILE>
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-j, --json` | Output in JSON format instead of text |
+| `-f, --filter <KINDS>` | Only show dependencies for functions of these kinds (comma-separated, e.g. `proof_fn`) |
+| `--non-empty` | Only show functions that have at least one dependency |
+
+### Output Format
+
+**Text (default):**
+```
+function_name (kind):
+  -> dependency1
+  -> dependency2
+
+function_with_no_deps (kind):
+  (none)
+```
+
+All functions are shown by default; use `--non-empty` to hide functions with zero dependencies.
+
+**JSON (`-j`):**
+```json
+[
+  {
+    "name": "my_proof",
+    "kind": "proof_fn",
+    "depends_on": ["my_spec", "Foo::helper_spec"]
+  }
+]
+```
+
+### Examples
+
+```bash
+# Show all dependencies
+lynette deps file.rs
+
+# Only proof_fn dependencies, as JSON
+lynette deps -j -f proof_fn file.rs
+
+# Only functions with at least one dependency
+lynette deps --non-empty file.rs
+
+# Proof functions that reference spec functions, as JSON
+lynette deps -j -f proof_fn --non-empty file.rs
+```
+
+### How It Works
+
+1. Parses the file with `syn_verus` and collects all function definitions (free functions, impl methods, trait methods, and functions inside inline modules)
+2. For each function, walks the AST of its body and signature spec clauses to collect all referenced identifiers (function calls, method calls, path references). Nested `fn` items inside a function body are **not** descended into — their references belong to the nested function, not the enclosing one. Struct constructors (e.g. `Foo { x: 1 }`) are skipped to avoid false positives from type names matching `spec_fn` names.
+3. Cross-references those identifiers against the set of `spec_fn` / `spec(checked)` functions defined in the same file
+4. For qualified references (e.g. `Foo::bar`), matches directly against known spec_fns. For bare names (e.g. `bar`), applies a **same-impl preference heuristic**: if the calling function is inside `impl Foo`, only `Foo::bar` is matched; otherwise all spec_fns with that bare name are included. Path prefixes `crate::`, `self::`, `super::`, and `Self::` are stripped to the bare last segment before matching — so `Self::bar()` inside `impl Foo` correctly resolves to `Foo::bar`.
+5. Reports matches using qualified names (e.g. `Foo::bar`) when available, or bare names (e.g. `bar`) otherwise
+
+### Scope
+
+The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, `spec_fn`, `fn`, etc.). The dependency targets (`depends_on`) are limited to **`spec_fn` and `spec_checked_fn`** defined in the same file — other function-to-function references (e.g. `proof_fn` → `proof_fn`) are not tracked. The `--filter` flag controls which source functions to *display*, not what is detected as a dependency target.
+
+### Naming
+
+Impl method names always use `Type::method`, regardless of whether the impl is inherent or a trait impl. This matches the naming used by `lynette list` and ensures the same-impl heuristic works correctly.
+
+### Limitations
+
+- Only detects references to `spec_fn`s defined **in the same file** — cross-file dependencies are not tracked.
+- Without full type resolution, bare method calls like `self.val()` are resolved heuristically:
+  - If the calling function is inside `impl Foo`, only `Foo::val` is matched (same-impl preference).
+  - If no same-impl candidate exists, or the caller is a free function, **all** `spec_fn`s named `val` in the file are matched (conservative fallback).
+  - This covers the common case correctly but can still over-approximate when a method calls a same-named `spec_fn` from a *different* impl via a field or argument.
+- Variable names that coincide with a `spec_fn` name can cause false positives when the variable is used as an expression (e.g. `let x = len;` where `spec fn len()` exists). Pattern bindings (`let len = 5;`) are **not** affected.
+- Macro invocations and `unsafe` blocks are not traversed — references to `spec_fn`s inside them will be missed.
 
 ---
 
