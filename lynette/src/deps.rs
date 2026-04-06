@@ -103,6 +103,11 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
                     collect_idents_expr(expr, out);
                 }
             }
+            if let Some(ref ens) = w.ensures {
+                for expr in &ens.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
         }
         syn_verus::Expr::ForLoop(fl) => {
             collect_idents_expr(&fl.expr, out);
@@ -144,9 +149,24 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
                     collect_idents_expr(expr, out);
                 }
             }
+            if let Some(ref ens) = l.ensures {
+                for expr in &ens.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
         }
         syn_verus::Expr::Closure(cl) => {
             collect_idents_expr(&cl.body, out);
+            if let Some(ref req) = cl.requires {
+                for expr in &req.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
+            if let Some(ref ens) = cl.ensures {
+                for expr in &ens.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
         }
         syn_verus::Expr::Field(f) => {
             collect_idents_expr(&f.base, out);
@@ -437,10 +457,12 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                     dep_set.insert(ident.clone());
                     continue;
                 }
-                // For module-qualified paths (e.g. `crate::my_spec`, `m::spec1`) that
-                // don't directly match, fall back to the bare last segment so we can
-                // still resolve against known spec_fns.
-                let resolved_ident = if ident.contains("::") {
+                // For Rust path prefixes (crate::, self::, super::) that don't
+                // directly match a known spec_fn, fall back to the bare last
+                // segment for resolution. Other qualified paths (e.g. Foo::bar)
+                // that didn't match are left as-is — they were already checked
+                // against spec_qualified above.
+                let resolved_ident = if ident.starts_with("crate::") || ident.starts_with("self::") || ident.starts_with("super::") {
                     ident.rsplit("::").next().unwrap_or(ident)
                 } else {
                     ident.as_str()
