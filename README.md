@@ -198,7 +198,7 @@ lynette deps -j -f proof_fn --non-empty file.rs
 
 ### Scope
 
-The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, `spec_fn`, `default_fn`, etc.). The dependency targets (`depends_on`) are limited to **`spec_fn` and `spec_checked_fn`** defined in the same file — other function-to-function references (e.g. `proof_fn` → `proof_fn`) are not tracked. The `--filter` flag controls which source functions to *display*, not what is detected as a dependency target.
+The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, `spec_fn`, `fn`, etc.). The dependency targets (`depends_on`) are limited to **`spec_fn` and `spec_checked_fn`** defined in the same file — other function-to-function references (e.g. `proof_fn` → `proof_fn`) are not tracked. The `--filter` flag controls which source functions to *display*, not what is detected as a dependency target.
 
 ### Limitations
 
