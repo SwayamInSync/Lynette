@@ -366,9 +366,19 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             if impl_name.is_empty() {
                 return;
             }
+            // For trait impls, use `<Self as Trait>` to match list_segments naming
+            let qualified_name = if let Some((_, ref trait_path, _)) = i.trait_ {
+                let trait_name = trait_path.segments.iter()
+                    .map(|s| s.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                format!("<{} as {}>", impl_name, trait_name)
+            } else {
+                impl_name.clone()
+            };
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
-                    let fn_name = format!("{}::{}", impl_name, m.sig.ident);
+                    let fn_name = format!("{}::{}", qualified_name, m.sig.ident);
                     let kind = fn_mode_to_kind(&m.sig.mode);
 
                     let mut idents = HashSet::new();
