@@ -1044,21 +1044,33 @@ mod cli_tests {
 
     fn lynette_bin() -> PathBuf {
         // cargo test builds the binary; its path is next to the test binary
-        let mut p = std::env::current_exe().unwrap();
-        p.pop(); // remove test binary name
-        p.pop(); // remove "deps-*" directory
-        p.push("lynette");
-        if p.exists() {
-            return p;
+        let mut sibling = std::env::current_exe().unwrap();
+        sibling.pop(); // remove test binary name
+        sibling.pop(); // remove "deps-*" directory
+        sibling.push("lynette");
+        if sibling.exists() {
+            return sibling;
         }
+
         // Fallback: use CARGO_MANIFEST_DIR
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop();
-        let release = p.join("target/release/lynette");
+        let mut workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        workspace_root.pop();
+        let release = workspace_root.join("target/release/lynette");
         if release.exists() {
             return release;
         }
-        p.join("target/debug/lynette")
+
+        let debug = workspace_root.join("target/debug/lynette");
+        if debug.exists() {
+            return debug;
+        }
+
+        panic!(
+            "could not find lynette binary for CLI tests; looked for: {}, {}, {}",
+            sibling.display(),
+            release.display(),
+            debug.display()
+        );
     }
 
     fn fixture_path(name: &str) -> PathBuf {

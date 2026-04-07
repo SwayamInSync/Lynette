@@ -8,13 +8,13 @@ pub struct MyData {
     pub val: int,
 }
 
-spec fn MyData_spec() -> int { 42 }
+spec fn MyData() -> int { 42 }
 
 spec fn unrelated_spec() -> bool { true }
 
 // bar_maker uses struct literal MyData { val: 1 }.
 // "MyData" is the struct path, NOT a function call.
-// It should NOT depend on MyData_spec.
+// It should NOT depend on the same-named spec fn MyData.
 spec fn bar_maker() -> int {
     let d = MyData { val: 1 };
     d.val
