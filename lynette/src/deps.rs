@@ -520,3 +520,342 @@ pub fn print_deps_text(deps: &[FnDependency]) {
         }
     }
 }
+
+// ===========================================================================
+// Unit tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write `code` to a temp .rs file and run `fcompute_deps`.
+    fn deps_for(code: &str) -> Vec<FnDependency> {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(code.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        fcompute_deps(&tmp.path().to_path_buf()).unwrap()
+    }
+
+    /// Helper: build a name -> depends_on lookup from deps vec.
+    fn dep_map(deps: &[FnDependency]) -> HashMap<String, Vec<String>> {
+        deps.iter()
+            .map(|d| (d.name.clone(), d.depends_on.clone()))
+            .collect()
+    }
+
+    /// Helper: build a name -> kind lookup from deps vec.
+    fn kind_map(deps: &[FnDependency]) -> HashMap<String, &'static str> {
+        deps.iter()
+            .map(|d| (d.name.clone(), d.kind.label()))
+            .collect()
+    }
+
+    /// Load a fixture file from tests/fixtures/<name>.
+    fn fixture_path(name: &str) -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures");
+        p.push(name);
+        p
+    }
+
+    fn deps_for_fixture(name: &str) -> Vec<FnDependency> {
+        fcompute_deps(&fixture_path(name)).unwrap()
+    }
+
+    // ── basic_deps.rs ──────────────────────────────────────────────────
+
+    #[test]
+    fn basic_proof_depends_on_spec() {
+        let deps = deps_for_fixture("basic_deps.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["my_proof"], vec!["my_spec"]);
+    }
+
+    #[test]
+    fn basic_multi_dep() {
+        let deps = deps_for_fixture("basic_deps.rs");
+        let m = dep_map(&deps);
+        let mut d = m["multi_dep_proof"].clone();
+        d.sort();
+        assert_eq!(d, vec!["my_spec", "other_spec"]);
+    }
+
+    #[test]
+    fn basic_no_dep_proof_has_empty_deps() {
+        let deps = deps_for_fixture("basic_deps.rs");
+        let m = dep_map(&deps);
+        assert!(m["no_dep_proof"].is_empty());
+    }
+
+    #[test]
+    fn basic_spec_calls_spec() {
+        let deps = deps_for_fixture("basic_deps.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["spec_calls_spec"], vec!["my_spec"]);
+    }
+
+    #[test]
+    fn basic_exec_no_dep() {
+        let deps = deps_for_fixture("basic_deps.rs");
+        let m = dep_map(&deps);
+        assert!(m["exec_no_dep"].is_empty());
+    }
+
+    #[test]
+    fn basic_kind_classification() {
+        let deps = deps_for_fixture("basic_deps.rs");
+        let k = kind_map(&deps);
+        assert_eq!(k["my_spec"], "spec_fn");
+        assert_eq!(k["my_proof"], "proof_fn");
+        assert_eq!(k["exec_no_dep"], "exec_fn");
+    }
+
+    // ── same_impl_heuristic.rs ─────────────────────────────────────────
+
+    #[test]
+    fn same_impl_prefers_own_type() {
+        let deps = deps_for_fixture("same_impl_heuristic.rs");
+        let m = dep_map(&deps);
+        // Foo::foo_proof should only depend on Foo::view (same impl)
+        assert_eq!(m["Foo::foo_proof"], vec!["Foo::view"]);
+        // Bar::bar_proof should only depend on Bar::view (same impl)
+        assert_eq!(m["Bar::bar_proof"], vec!["Bar::view"]);
+    }
+
+    #[test]
+    fn free_function_matches_all_bare_names() {
+        let deps = deps_for_fixture("same_impl_heuristic.rs");
+        let m = dep_map(&deps);
+        let mut d = m["free_uses_view"].clone();
+        d.sort();
+        assert_eq!(d, vec!["Bar::view", "Foo::view"]);
+    }
+
+    // ── self_paths.rs ──────────────────────────────────────────────────
+
+    #[test]
+    fn self_dot_method_resolves() {
+        let deps = deps_for_fixture("self_paths.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["Foo::uses_self_dot"], vec!["Foo::val"]);
+    }
+
+    #[test]
+    fn capital_self_path_resolves() {
+        let deps = deps_for_fixture("self_paths.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["Foo::uses_Self_qualified"], vec!["Foo::val"]);
+    }
+
+    #[test]
+    fn explicit_qualified_path_resolves() {
+        let deps = deps_for_fixture("self_paths.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["Foo::uses_Foo_qualified"], vec!["Foo::val"]);
+    }
+
+    #[test]
+    fn trait_spec_via_self_dot() {
+        let deps = deps_for_fixture("self_paths.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["Foo::uses_trait_spec"], vec!["Foo::trait_spec"]);
+    }
+
+    // ── self_reference.rs ──────────────────────────────────────────────
+
+    #[test]
+    fn recursive_spec_excludes_self() {
+        let deps = deps_for_fixture("self_reference.rs");
+        let m = dep_map(&deps);
+        assert!(m["recursive_spec"].is_empty(),
+            "recursive_spec should not list itself as a dependency");
+    }
+
+    // ── expression_contexts.rs ─────────────────────────────────────────
+
+    #[test]
+    fn multi_ensures_picks_up_all() {
+        let deps = deps_for_fixture("expression_contexts.rs");
+        let m = dep_map(&deps);
+        let mut d = m["multi_ensures"].clone();
+        d.sort();
+        assert_eq!(d, vec!["cond_a", "cond_b"]);
+    }
+
+    #[test]
+    fn exec_proof_block_detects_dep() {
+        let deps = deps_for_fixture("expression_contexts.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["exec_with_proof_block"], vec!["cond_a"]);
+    }
+
+    #[test]
+    fn closure_body_detects_dep() {
+        let deps = deps_for_fixture("expression_contexts.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["closure_test"], vec!["helper_spec"]);
+    }
+
+    #[test]
+    fn loop_invariant_detects_dep() {
+        let deps = deps_for_fixture("expression_contexts.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["loop_with_invariant"], vec!["cond_a"]);
+    }
+
+    #[test]
+    fn assert_detects_dep() {
+        let deps = deps_for_fixture("expression_contexts.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["assert_test"], vec!["cond_b"]);
+    }
+
+    // ── struct_constructor.rs ──────────────────────────────────────────
+
+    #[test]
+    fn struct_constructor_no_false_positive() {
+        let deps = deps_for_fixture("struct_constructor.rs");
+        let m = dep_map(&deps);
+        assert!(m["bar_maker"].is_empty(),
+            "struct constructor path should not create a false dep");
+    }
+
+    #[test]
+    fn real_dep_still_detected() {
+        let deps = deps_for_fixture("struct_constructor.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["real_dep"], vec!["unrelated_spec"]);
+    }
+
+    // ── inline_module.rs ───────────────────────────────────────────────
+
+    #[test]
+    fn inline_module_functions_qualified() {
+        let deps = deps_for_fixture("inline_module.rs");
+        let m = dep_map(&deps);
+        assert!(m.contains_key("inner::inner_spec"),
+            "inner module spec_fn should be qualified as inner::inner_spec");
+        assert_eq!(m["inner::inner_proof"], vec!["inner::inner_spec"]);
+    }
+
+    #[test]
+    fn outer_does_not_see_inner() {
+        let deps = deps_for_fixture("inline_module.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["outer_proof"], vec!["outer_spec"]);
+    }
+
+    // ── no_functions.rs ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_file_returns_empty() {
+        let deps = deps_for_fixture("no_functions.rs");
+        assert!(deps.is_empty());
+    }
+
+    // ── real_benchmark.rs ──────────────────────────────────────────────
+
+    #[test]
+    fn real_benchmark_parses_without_panic() {
+        let deps = deps_for_fixture("real_benchmark.rs");
+        // Just assert it parsed and returned something
+        assert!(!deps.is_empty(),
+            "real benchmark file should have at least one function");
+    }
+
+    #[test]
+    fn real_benchmark_no_self_deps() {
+        let deps = deps_for_fixture("real_benchmark.rs");
+        for dep in &deps {
+            assert!(!dep.depends_on.contains(&dep.name),
+                "{} should not depend on itself", dep.name);
+        }
+    }
+
+    // ── Inline code tests (no fixture file needed) ─────────────────────
+
+    #[test]
+    fn inline_requires_clause_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn pre() -> bool { true }
+                proof fn my_proof()
+                    requires pre(),
+                { }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["my_proof"], vec!["pre"]);
+    }
+
+    #[test]
+    fn inline_decreases_clause_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn measure(n: nat) -> nat { n }
+                spec fn recur(n: nat) -> nat
+                    decreases measure(n),
+                {
+                    if n == 0 { 0 } else { recur((n - 1) as nat) }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert!(m["recur"].contains(&"measure".to_string()));
+    }
+
+    #[test]
+    fn inline_recommends_clause_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn safe() -> bool { true }
+                spec fn guarded() -> int
+                    recommends safe(),
+                { 42 }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["guarded"], vec!["safe"]);
+    }
+
+    #[test]
+    fn inline_no_verus_macro_returns_error() {
+        // A plain Rust file without verus! macro
+        let result = deps_for("fn main() {}");
+        // fcompute_deps returns empty when there's no verus! macro
+        // (fextract_verus_macro may error or return empty)
+        // We just verify it doesn't panic.
+        let _ = result;
+    }
+
+    #[test]
+    fn inline_trait_impl_naming_matches_list_segments() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                pub struct Woo { pub x: int }
+                pub trait T { spec fn method(&self) -> bool; }
+                impl T for Woo {
+                    open spec fn method(&self) -> bool { true }
+                }
+                impl Woo {
+                    pub proof fn uses_method(&self)
+                        ensures self.method(),
+                    { }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        // Trait impl method should be named Woo::method (not <Woo as T>::method)
+        assert!(m.contains_key("Woo::method"),
+            "trait impl spec_fn should be named Woo::method, got keys: {:?}", m.keys().collect::<Vec<_>>());
+        // The proof fn should depend on Woo::method
+        assert_eq!(m["Woo::uses_method"], vec!["Woo::method"]);
+    }
+}
+

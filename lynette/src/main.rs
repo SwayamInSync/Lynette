@@ -1032,3 +1032,172 @@ fn main() {
         }
     };
 }
+
+// ===========================================================================
+// CLI integration tests
+// ===========================================================================
+
+#[cfg(test)]
+mod cli_tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn lynette_bin() -> PathBuf {
+        // cargo test builds the binary; its path is next to the test binary
+        let mut sibling = std::env::current_exe().unwrap();
+        sibling.pop(); // remove test binary name
+        sibling.pop(); // remove "deps-*" directory
+        sibling.push("lynette");
+        if sibling.exists() {
+            return sibling;
+        }
+
+        // Fallback: use CARGO_MANIFEST_DIR
+        let mut workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        workspace_root.pop();
+        let release = workspace_root.join("target/release/lynette");
+        if release.exists() {
+            return release;
+        }
+
+        let debug = workspace_root.join("target/debug/lynette");
+        if debug.exists() {
+            return debug;
+        }
+
+        panic!(
+            "could not find lynette binary for CLI tests; looked for: {}, {}, {}",
+            sibling.display(),
+            release.display(),
+            debug.display()
+        );
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("tests/fixtures");
+        p.push(name);
+        p
+    }
+
+    fn run_deps(args: &[&str], fixture: &str) -> (String, String, i32) {
+        let fix = fixture_path(fixture);
+        let fix_str = fix.to_str().unwrap();
+        let mut cmd_args: Vec<&str> = vec!["deps"];
+        cmd_args.extend_from_slice(args);
+        cmd_args.push(fix_str);
+        let output = Command::new(lynette_bin())
+            .args(&cmd_args)
+            .output()
+            .expect("failed to execute lynette");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let code = output.status.code().unwrap_or(-1);
+        (stdout, stderr, code)
+    }
+
+    #[test]
+    fn cli_deps_json_output_is_valid() {
+        let (stdout, _, code) = run_deps(&["-j"], "basic_deps.rs");
+        assert_eq!(code, 0, "exit code should be 0");
+        let parsed: serde_json::Value = serde_json::from_str(&stdout)
+            .expect("deps -j should produce valid JSON");
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn cli_deps_text_output_contains_arrow() {
+        let (stdout, _, code) = run_deps(&["--non-empty"], "basic_deps.rs");
+        assert_eq!(code, 0);
+        assert!(stdout.contains("->"), "text output should contain '->' arrows for deps");
+    }
+
+    #[test]
+    fn cli_deps_filter_by_kind() {
+        let (stdout, _, code) = run_deps(&["-j", "-f", "proof_fn"], "basic_deps.rs");
+        assert_eq!(code, 0);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+        assert!(!parsed.is_empty(), "there should be proof_fn entries");
+        for entry in &parsed {
+            assert_eq!(entry["kind"], "proof_fn",
+                "filtering by proof_fn should only return proof_fn entries");
+        }
+    }
+
+    #[test]
+    fn cli_deps_non_empty_excludes_no_dep_fns() {
+        let (stdout, _, code) = run_deps(&["-j", "--non-empty"], "basic_deps.rs");
+        assert_eq!(code, 0);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+        for entry in &parsed {
+            let deps = entry["depends_on"].as_array().unwrap();
+            assert!(!deps.is_empty(),
+                "--non-empty should exclude functions with no dependencies");
+        }
+    }
+
+    #[test]
+    fn cli_deps_combined_filter_and_non_empty() {
+        let (stdout, _, code) = run_deps(
+            &["-j", "-f", "proof_fn", "--non-empty"],
+            "basic_deps.rs",
+        );
+        assert_eq!(code, 0);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+        for entry in &parsed {
+            assert_eq!(entry["kind"], "proof_fn");
+            assert!(!entry["depends_on"].as_array().unwrap().is_empty());
+        }
+        let names: Vec<&str> = parsed.iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"my_proof"));
+        assert!(names.contains(&"multi_dep_proof"));
+        assert!(!names.contains(&"no_dep_proof"));
+    }
+
+    #[test]
+    fn cli_deps_invalid_file_returns_nonzero() {
+        let output = Command::new(lynette_bin())
+            .args(&["deps", "/tmp/nonexistent_file_12345.rs"])
+            .output()
+            .expect("failed to execute lynette");
+        assert_ne!(output.status.code().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn cli_deps_empty_file_returns_empty_json() {
+        let (stdout, _, code) = run_deps(&["-j"], "no_functions.rs");
+        assert_eq!(code, 0);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn cli_deps_text_none_for_no_deps() {
+        let (stdout, _, code) = run_deps(&[], "basic_deps.rs");
+        assert_eq!(code, 0);
+        assert!(stdout.contains("(none)"),
+            "functions with no deps should show (none) in text mode");
+    }
+
+    #[test]
+    fn cli_deps_json_has_required_fields() {
+        let (stdout, _, code) = run_deps(&["-j"], "basic_deps.rs");
+        assert_eq!(code, 0);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap();
+        assert!(!parsed.is_empty());
+        for entry in &parsed {
+            assert!(entry.get("name").is_some(), "each entry should have 'name'");
+            assert!(entry.get("kind").is_some(), "each entry should have 'kind'");
+            assert!(entry.get("depends_on").is_some(), "each entry should have 'depends_on'");
+            assert!(entry["depends_on"].is_array(), "'depends_on' should be an array");
+        }
+    }
+
+    #[test]
+    fn cli_deps_real_benchmark_no_panic() {
+        let (_, _, code) = run_deps(&["-j"], "real_benchmark.rs");
+        assert_eq!(code, 0, "real benchmark file should not panic");
+    }
+}
