@@ -441,7 +441,7 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
             // Check each referenced ident against known spec_fn names
             for ident in &info.referenced_idents {
                 // Direct qualified match: ident is "Foo::bar" and that's a known spec_fn
-                if spec_qualified.contains(ident) && *ident != info.name {
+                if spec_qualified.contains(ident) {
                     dep_set.insert(ident.clone());
                     continue;
                 }
@@ -471,9 +471,7 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                         qualified_list.iter().collect()
                     };
                     for q in candidates {
-                        if *q != info.name {
-                            dep_set.insert(q.clone());
-                        }
+                        dep_set.insert(q.clone());
                     }
                 }
             }
@@ -666,11 +664,11 @@ mod tests {
     // ── self_reference.rs ──────────────────────────────────────────────
 
     #[test]
-    fn recursive_spec_excludes_self() {
+    fn recursive_spec_includes_self() {
         let deps = deps_for_fixture("self_reference.rs");
         let m = dep_map(&deps);
-        assert!(m["recursive_spec"].is_empty(),
-            "recursive_spec should not list itself as a dependency");
+        assert_eq!(m["recursive_spec"], vec!["recursive_spec"],
+            "recursive_spec should list itself as a dependency");
     }
 
     // ── expression_contexts.rs ─────────────────────────────────────────
