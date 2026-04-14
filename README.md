@@ -194,7 +194,8 @@ lynette deps -j -f proof_fn --non-empty file.rs
 2. For each function, walks the AST of its body and signature spec clauses to collect all referenced identifiers (function calls, method calls, path references). Nested `fn` items inside a function body are **not** descended into — their references belong to the nested function, not the enclosing one. Struct constructors (e.g. `Foo { x: 1 }`) are skipped to avoid false positives from type names matching `spec_fn` names.
 3. Cross-references those identifiers against the set of `spec_fn` / `spec(checked)` functions defined in the same file
 4. For qualified references (e.g. `Foo::bar`), matches directly against known spec_fns. For bare names (e.g. `bar`), applies a **same-impl preference heuristic**: if the calling function is inside `impl Foo`, only `Foo::bar` is matched; otherwise all spec_fns with that bare name are included. Path prefixes `crate::`, `self::`, `super::`, and `Self::` are stripped to the bare last segment before matching — so `Self::bar()` inside `impl Foo` correctly resolves to `Foo::bar`.
-5. Reports matches using qualified names (e.g. `Foo::bar`) when available, or bare names (e.g. `bar`) otherwise
+5. **Self-references (recursion):** A function is listed as depending on itself only when it genuinely calls itself (i.e. its name appears in `func(...)` call position). A separate call-target analysis prevents false self-deps from parameters or variables that happen to shadow the function name.
+6. Reports matches using qualified names (e.g. `Foo::bar`) when available, or bare names (e.g. `bar`) otherwise
 
 ### Scope
 

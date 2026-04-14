@@ -17,6 +17,130 @@ pub struct FnDependency {
 // AST-based identifier collection
 // ---------------------------------------------------------------------------
 
+/// Extract the path string from a call-target expression (the `func` in `func(args)`).
+/// Returns `Some("foo")` for bare calls and `Some("Foo::bar")` for qualified calls.
+fn call_target_path(expr: &syn_verus::Expr) -> Option<String> {
+    match expr {
+        syn_verus::Expr::Path(p) => {
+            let segments: Vec<String> = p.path.segments.iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segments.len() > 1 {
+                Some(segments.join("::"))
+            } else {
+                segments.first().cloned()
+            }
+        }
+        syn_verus::Expr::Paren(p) => call_target_path(&p.expr),
+        _ => None,
+    }
+}
+
+/// Collect identifiers that appear as direct call targets (in `Expr::Call.func` position).
+fn collect_call_targets_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
+    match expr {
+        syn_verus::Expr::Call(call) => {
+            if let Some(target) = call_target_path(&call.func) {
+                out.insert(target);
+            }
+            collect_call_targets_expr(&call.func, out);
+            for arg in &call.args {
+                collect_call_targets_expr(arg, out);
+            }
+        }
+        syn_verus::Expr::MethodCall(m) => {
+            collect_call_targets_expr(&m.receiver, out);
+            for arg in &m.args {
+                collect_call_targets_expr(arg, out);
+            }
+        }
+        syn_verus::Expr::Binary(b) => {
+            collect_call_targets_expr(&b.left, out);
+            collect_call_targets_expr(&b.right, out);
+        }
+        syn_verus::Expr::Unary(u) => {
+            collect_call_targets_expr(&u.expr, out);
+        }
+        syn_verus::Expr::Block(bl) => {
+            for stmt in &bl.block.stmts {
+                collect_call_targets_stmt(stmt, out);
+            }
+        }
+        syn_verus::Expr::If(i) => {
+            collect_call_targets_expr(&i.cond, out);
+            for stmt in &i.then_branch.stmts {
+                collect_call_targets_stmt(stmt, out);
+            }
+            if let Some((_, ref else_expr)) = i.else_branch {
+                collect_call_targets_expr(else_expr, out);
+            }
+        }
+        syn_verus::Expr::Match(m) => {
+            collect_call_targets_expr(&m.expr, out);
+            for arm in &m.arms {
+                if let Some((_, ref gexpr)) = arm.guard {
+                    collect_call_targets_expr(gexpr, out);
+                }
+                collect_call_targets_expr(&arm.body, out);
+            }
+        }
+        syn_verus::Expr::Paren(p) => {
+            collect_call_targets_expr(&p.expr, out);
+        }
+        syn_verus::Expr::Group(g) => {
+            collect_call_targets_expr(&g.expr, out);
+        }
+        syn_verus::Expr::Return(r) => {
+            if let Some(ref expr) = r.expr {
+                collect_call_targets_expr(expr, out);
+            }
+        }
+        syn_verus::Expr::Tuple(t) => {
+            for elem in &t.elems {
+                collect_call_targets_expr(elem, out);
+            }
+        }
+        syn_verus::Expr::Reference(r) => {
+            collect_call_targets_expr(&r.expr, out);
+        }
+        syn_verus::Expr::Let(l) => {
+            collect_call_targets_expr(&l.expr, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_call_targets_stmt(stmt: &syn_verus::Stmt, out: &mut HashSet<String>) {
+    match stmt {
+        syn_verus::Stmt::Expr(e, _) => {
+            collect_call_targets_expr(e, out);
+        }
+        syn_verus::Stmt::Local(local) => {
+            if let Some(ref init) = local.init {
+                collect_call_targets_expr(&init.expr, out);
+            }
+        }
+        syn_verus::Stmt::Item(_) => {}
+        syn_verus::Stmt::Macro(_) => {}
+    }
+}
+
+/// Collect identifiers that appear as call targets in a function signature's spec clauses.
+fn collect_call_targets_sig(sig: &syn_verus::Signature, out: &mut HashSet<String>) {
+    if let Some(ref r) = sig.spec.requires {
+        for expr in &r.exprs.exprs { collect_call_targets_expr(expr, out); }
+    }
+    if let Some(ref e) = sig.spec.ensures {
+        for expr in &e.exprs.exprs { collect_call_targets_expr(expr, out); }
+    }
+    if let Some(ref r) = sig.spec.recommends {
+        for expr in &r.exprs.exprs { collect_call_targets_expr(expr, out); }
+    }
+    if let Some(ref d) = sig.spec.decreases {
+        for expr in &d.decreases.exprs.exprs { collect_call_targets_expr(expr, out); }
+    }
+}
+
 /// Collect all identifiers referenced in an expression (function calls, method calls, paths).
 fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
     match expr {
@@ -324,6 +448,10 @@ struct FnInfo {
     impl_type: Option<String>,
     /// All identifiers referenced by this function (signature specs + body).
     referenced_idents: HashSet<String>,
+    /// Identifiers that appear specifically as call targets (`func(...)` position).
+    /// Used to detect genuine recursive calls without false positives from
+    /// shadowed bindings/parameters that happen to share a function name.
+    call_target_idents: HashSet<String>,
 }
 
 /// Walk a top-level item and collect `FnInfo` for each function definition
@@ -344,7 +472,13 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
                 collect_idents_stmt(stmt, &mut idents);
             }
 
-            out.push(FnInfo { name, kind, impl_type: None, referenced_idents: idents });
+            let mut call_targets = HashSet::new();
+            collect_call_targets_sig(&f.sig, &mut call_targets);
+            for stmt in &f.block.stmts {
+                collect_call_targets_stmt(stmt, &mut call_targets);
+            }
+
+            out.push(FnInfo { name, kind, impl_type: None, referenced_idents: idents, call_target_idents: call_targets });
         }
         syn_verus::Item::Impl(i) => {
             let impl_name = type_path_to_string(&i.self_ty);
@@ -365,7 +499,13 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
                         collect_idents_stmt(stmt, &mut idents);
                     }
 
-                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(impl_name.clone()), referenced_idents: idents });
+                    let mut call_targets = HashSet::new();
+                    collect_call_targets_sig(&m.sig, &mut call_targets);
+                    for stmt in &m.block.stmts {
+                        collect_call_targets_stmt(stmt, &mut call_targets);
+                    }
+
+                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(impl_name.clone()), referenced_idents: idents, call_target_idents: call_targets });
                 }
             }
         }
@@ -388,7 +528,15 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
                         }
                     }
 
-                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(trait_name.clone()), referenced_idents: idents });
+                    let mut call_targets = HashSet::new();
+                    collect_call_targets_sig(&m.sig, &mut call_targets);
+                    if let Some(ref default_block) = m.default {
+                        for stmt in &default_block.stmts {
+                            collect_call_targets_stmt(stmt, &mut call_targets);
+                        }
+                    }
+
+                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(trait_name.clone()), referenced_idents: idents, call_target_idents: call_targets });
                 }
             }
         }
@@ -438,11 +586,23 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
         for info in &fn_infos {
             let mut dep_set: HashSet<String> = HashSet::new();
 
+            // Pre-compute whether this function genuinely calls itself
+            // (i.e. its name appears in call-target position, not just as
+            // a path expression that could be a shadowed binding/parameter).
+            let bare_name = info.name.rsplit("::").next().unwrap_or(&info.name);
+            let self_qualified = format!("Self::{}", bare_name);
+            let self_is_called = info.call_target_idents.contains(&info.name)
+                || info.call_target_idents.contains(bare_name)
+                || info.call_target_idents.contains(&self_qualified);
+
             // Check each referenced ident against known spec_fn names
             for ident in &info.referenced_idents {
-                // Direct qualified match: ident is "Foo::bar" and that's a known spec_fn
+                // Direct qualified match: ident is "Foo::bar" and that's a known spec_fn.
+                // For self-references, only include if it appears as a call target.
                 if spec_qualified.contains(ident) {
-                    dep_set.insert(ident.clone());
+                    if *ident != info.name || self_is_called {
+                        dep_set.insert(ident.clone());
+                    }
                     continue;
                 }
                 // For Rust path prefixes (crate::, self::, super::, Self::)
@@ -471,7 +631,9 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                         qualified_list.iter().collect()
                     };
                     for q in candidates {
-                        dep_set.insert(q.clone());
+                        if *q != info.name || self_is_called {
+                            dep_set.insert(q.clone());
+                        }
                     }
                 }
             }
@@ -668,7 +830,52 @@ mod tests {
         let deps = deps_for_fixture("self_reference.rs");
         let m = dep_map(&deps);
         assert_eq!(m["recursive_spec"], vec!["recursive_spec"],
-            "recursive_spec should list itself as a dependency");
+            "recursive_spec should list itself as a dependency (genuine recursive call)");
+    }
+
+    #[test]
+    fn shadowed_param_false_positive() {
+        let deps = deps_for_fixture("self_reference.rs");
+        let m = dep_map(&deps);
+        // Known limitation: `shadowed_param` has a parameter named `helper_spec`
+        // which matches the spec_fn name. Since cross-function dep detection uses
+        // all path expressions (not just call targets), this is a false positive.
+        assert_eq!(m["shadowed_param"], vec!["helper_spec"],
+            "shadowed_param picks up helper_spec as a false positive (known limitation)");
+    }
+
+    #[test]
+    fn recursive_with_other_dep() {
+        let deps = deps_for_fixture("self_reference.rs");
+        let m = dep_map(&deps);
+        let mut d = m["recursive_with_dep"].clone();
+        d.sort();
+        assert_eq!(d, vec!["helper_spec", "recursive_with_dep"],
+            "recursive_with_dep should list both itself and helper_spec");
+    }
+
+    #[test]
+    fn non_call_self_ref_no_self_dep() {
+        let deps = deps_for_fixture("self_reference.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["non_call_self_ref"], vec!["helper_spec"],
+            "non_call_self_ref should only depend on helper_spec, not itself");
+    }
+
+    #[test]
+    fn impl_recursive_includes_self() {
+        let deps = deps_for_fixture("self_reference.rs");
+        let m = dep_map(&deps);
+        assert_eq!(m["MyStruct::impl_recursive"], vec!["MyStruct::impl_recursive"],
+            "impl method that calls Self::impl_recursive should list itself");
+    }
+
+    #[test]
+    fn impl_non_recursive_no_self_dep() {
+        let deps = deps_for_fixture("self_reference.rs");
+        let m = dep_map(&deps);
+        assert!(m["MyStruct::impl_non_recursive"].is_empty(),
+            "non-recursive impl method should not list itself");
     }
 
     // ── expression_contexts.rs ─────────────────────────────────────────
