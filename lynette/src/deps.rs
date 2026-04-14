@@ -695,6 +695,287 @@ fn collect_idents_sig(sig: &syn_verus::Signature, out: &mut HashSet<String>) {
 // Top-level dependency analysis
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Best-effort local macro expansion for dependency analysis
+// ---------------------------------------------------------------------------
+
+/// Maps macro name -> list of arm body token streams.
+type LocalMacros = HashMap<String, Vec<proc_macro2::TokenStream>>;
+
+/// Extract arm body token streams from a `macro_rules!` definition's tokens.
+///
+/// The token format is: `(pattern) => { body }; ...`
+/// We look for `=> <group>` and extract the group's contents.
+fn extract_macro_arm_bodies(tokens: &proc_macro2::TokenStream) -> Vec<proc_macro2::TokenStream> {
+    let mut bodies = Vec::new();
+    let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    let mut i = 0;
+    while i + 2 < tts.len() {
+        if let proc_macro2::TokenTree::Punct(ref eq) = tts[i] {
+            if eq.as_char() == '=' {
+                if let proc_macro2::TokenTree::Punct(ref gt) = tts[i + 1] {
+                    if gt.as_char() == '>' {
+                        if let proc_macro2::TokenTree::Group(ref g) = tts[i + 2] {
+                            bodies.push(g.stream());
+                            i += 3;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    bodies
+}
+
+/// Collect `macro_rules!` definitions from a single item (recursing into modules).
+fn collect_macros_from_item(item: &syn_verus::Item, macros: &mut LocalMacros) {
+    match item {
+        syn_verus::Item::Macro(m) => {
+            if let Some(ref ident) = m.ident {
+                let bodies = extract_macro_arm_bodies(&m.mac.tokens);
+                if !bodies.is_empty() {
+                    macros.insert(ident.to_string(), bodies);
+                }
+            }
+        }
+        syn_verus::Item::Mod(m) => {
+            if let Some((_, ref items)) = m.content {
+                for item in items {
+                    collect_macros_from_item(item, macros);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect local `macro_rules!` definitions from the **entire** file — both
+/// inside and outside `verus!{}` blocks — so that macros defined at module
+/// scope are available for expansion.
+fn collect_local_macros(
+    verus_files: &[syn_verus::File],
+    orig_file: &syn_verus::File,
+) -> LocalMacros {
+    let mut macros = HashMap::new();
+
+    // 1) Macros inside verus!{} blocks (already parsed into separate syn_verus::Files)
+    for file in verus_files {
+        for item in &file.items {
+            collect_macros_from_item(item, &mut macros);
+        }
+    }
+
+    // 2) Macros outside verus!{} blocks (from the original full-file parse).
+    //    The verus!{} blocks appear as Item::Macro in orig_file; we skip those
+    //    (already handled above) and collect from everything else.
+    for item in &orig_file.items {
+        if let syn_verus::Item::Macro(ref m) = item {
+            if crate::utils::is_verus_macro(&m.mac) {
+                continue; // already collected from verus_files
+            }
+        }
+        collect_macros_from_item(item, &mut macros);
+    }
+
+    macros
+}
+
+// ---------------------------------------------------------------------------
+// Token-level identifier and call-target scanning (for macro bodies)
+// ---------------------------------------------------------------------------
+
+/// Build a qualified path string from consecutive `Ident :: Ident :: ...` tokens
+/// starting at position `start`. Returns `(path_string, next_index)`.
+fn read_qualified_path(tts: &[proc_macro2::TokenTree], start: usize) -> (String, usize) {
+    let mut segments = Vec::new();
+    if let proc_macro2::TokenTree::Ident(ref first) = tts[start] {
+        segments.push(first.to_string());
+    } else {
+        return (String::new(), start + 1);
+    }
+    let mut i = start + 1;
+    // Look for `:: Ident` continuations
+    while i + 2 <= tts.len() {
+        // `::` is two consecutive Punct tokens `:` `:` (with Spacing::Joint on the first)
+        let is_colon_colon = matches!(
+            (&tts[i], tts.get(i + 1)),
+            (proc_macro2::TokenTree::Punct(a), Some(proc_macro2::TokenTree::Punct(b)))
+                if a.as_char() == ':' && b.as_char() == ':'
+        );
+        if !is_colon_colon {
+            break;
+        }
+        if i + 2 < tts.len() {
+            if let proc_macro2::TokenTree::Ident(ref seg) = tts[i + 2] {
+                segments.push(seg.to_string());
+                i += 3;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    let path = segments.join("::");
+    (path, i)
+}
+
+/// Scan a token stream for identifiers, including qualified paths like `Foo::bar`.
+/// Collects both the full qualified path and (for non-single-segment paths)
+/// is consistent with how `collect_idents_expr` handles `Expr::Path`.
+fn collect_idents_from_tokens(tokens: &proc_macro2::TokenStream, out: &mut HashSet<String>) {
+    let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    let mut i = 0;
+    while i < tts.len() {
+        match &tts[i] {
+            proc_macro2::TokenTree::Ident(_) => {
+                let (path, next) = read_qualified_path(&tts, i);
+                if !path.is_empty() {
+                    out.insert(path);
+                }
+                i = next;
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                collect_idents_from_tokens(&g.stream(), out);
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+}
+
+/// Scan a token stream for call targets: `ident(...)` and `Foo::bar(...)`.
+/// A call target is a (possibly qualified) path immediately followed by a
+/// parenthesized group.
+fn collect_call_targets_from_tokens(tokens: &proc_macro2::TokenStream, out: &mut HashSet<String>) {
+    let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    let mut i = 0;
+    while i < tts.len() {
+        match &tts[i] {
+            proc_macro2::TokenTree::Ident(_) => {
+                let (path, next) = read_qualified_path(&tts, i);
+                // Check if the path is immediately followed by `(...)`
+                if !path.is_empty() && next < tts.len() {
+                    if let proc_macro2::TokenTree::Group(ref g) = tts[next] {
+                        if g.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                            out.insert(path.clone());
+                            // Also insert bare last segment for resolution
+                            if path.contains("::") {
+                                if let Some(bare) = path.rsplit("::").next() {
+                                    out.insert(bare.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also recurse into any groups we may have skipped
+                i = next;
+            }
+            proc_macro2::TokenTree::Group(g) => {
+                collect_call_targets_from_tokens(&g.stream(), out);
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+}
+
+/// Search a token stream for invocations of known local macros (`name!`).
+fn find_macro_uses_in_tokens(
+    tokens: &proc_macro2::TokenStream,
+    local_macros: &LocalMacros,
+    invoked: &mut HashSet<String>,
+) {
+    let tts: Vec<proc_macro2::TokenTree> = tokens.clone().into_iter().collect();
+    for i in 0..tts.len() {
+        if let proc_macro2::TokenTree::Ident(ref ident) = tts[i] {
+            let name = ident.to_string();
+            if local_macros.contains_key(&name) && i + 1 < tts.len() {
+                if let proc_macro2::TokenTree::Punct(ref p) = tts[i + 1] {
+                    if p.as_char() == '!' {
+                        invoked.insert(name);
+                    }
+                }
+            }
+        }
+        if let proc_macro2::TokenTree::Group(ref g) = tts[i] {
+            find_macro_uses_in_tokens(&g.stream(), local_macros, invoked);
+        }
+    }
+}
+
+/// Transitively expand local macro invocations: given a set of directly
+/// invoked macro names, also find macros invoked *inside* those macro bodies,
+/// and so on until a fixed point (with cycle detection).
+fn transitive_macro_expand(
+    direct_invocations: &HashSet<String>,
+    local_macros: &LocalMacros,
+) -> HashSet<String> {
+    let mut all_invoked = direct_invocations.clone();
+    let mut worklist: Vec<String> = direct_invocations.iter().cloned().collect();
+
+    while let Some(macro_name) = worklist.pop() {
+        if let Some(bodies) = local_macros.get(&macro_name) {
+            for body in bodies {
+                let mut nested = HashSet::new();
+                find_macro_uses_in_tokens(body, local_macros, &mut nested);
+                for name in nested {
+                    if all_invoked.insert(name.clone()) {
+                        worklist.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    all_invoked
+}
+
+/// Expand local macro invocations found in a function body and signature,
+/// adding discovered identifiers and call targets from macro definition bodies.
+/// Handles:
+/// - Macros defined both inside and outside `verus!{}` blocks
+/// - Transitive/nested macro invocations (with cycle detection)
+/// - Qualified paths (`Foo::bar(...)`) inside macro bodies
+fn expand_local_macros(
+    stmts: &[syn_verus::Stmt],
+    sig: &syn_verus::Signature,
+    local_macros: &LocalMacros,
+    idents: &mut HashSet<String>,
+    call_targets: &mut HashSet<String>,
+) {
+    if local_macros.is_empty() {
+        return;
+    }
+    use quote::ToTokens;
+    let mut tokens = proc_macro2::TokenStream::new();
+    for stmt in stmts {
+        stmt.to_tokens(&mut tokens);
+    }
+    sig.to_tokens(&mut tokens);
+
+    // Find directly invoked local macros
+    let mut direct_invocations = HashSet::new();
+    find_macro_uses_in_tokens(&tokens, local_macros, &mut direct_invocations);
+
+    // Transitively expand to find nested macro invocations
+    let all_invoked = transitive_macro_expand(&direct_invocations, local_macros);
+
+    // Collect idents and call targets from all transitively reachable macro bodies
+    for macro_name in &all_invoked {
+        if let Some(bodies) = local_macros.get(macro_name) {
+            for body in bodies {
+                collect_idents_from_tokens(body, idents);
+                collect_call_targets_from_tokens(body, call_targets);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Information about a function definition needed for dependency analysis.
 struct FnInfo {
     name: String,
@@ -715,7 +996,7 @@ struct FnInfo {
 
 /// Walk a top-level item and collect `FnInfo` for each function definition
 /// (all kinds: spec, spec-checked, proof, proof-axiom, exec, and default).
-fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInfo>) {
+fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, local_macros: &LocalMacros, out: &mut Vec<FnInfo>) {
     match item {
         syn_verus::Item::Fn(f) => {
             let name = if namespace.is_empty() {
@@ -736,6 +1017,8 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             for stmt in &f.block.stmts {
                 collect_call_targets_stmt(stmt, &mut call_targets);
             }
+
+            expand_local_macros(&f.block.stmts, &f.sig, local_macros, &mut idents, &mut call_targets);
 
             out.push(FnInfo { name, kind, impl_type: None, referenced_idents: idents, call_target_idents: call_targets });
         }
@@ -763,6 +1046,8 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
                     for stmt in &m.block.stmts {
                         collect_call_targets_stmt(stmt, &mut call_targets);
                     }
+
+                    expand_local_macros(&m.block.stmts, &m.sig, local_macros, &mut idents, &mut call_targets);
 
                     out.push(FnInfo { name: fn_name, kind, impl_type: Some(impl_name.clone()), referenced_idents: idents, call_target_idents: call_targets });
                 }
@@ -795,6 +1080,10 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
                         }
                     }
 
+                    let default_stmts: &[syn_verus::Stmt] = m.default.as_ref()
+                        .map(|b| b.stmts.as_slice()).unwrap_or(&[]);
+                    expand_local_macros(default_stmts, &m.sig, local_macros, &mut idents, &mut call_targets);
+
                     out.push(FnInfo { name: fn_name, kind, impl_type: Some(trait_name.clone()), referenced_idents: idents, call_target_idents: call_targets });
                 }
             }
@@ -807,7 +1096,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
             };
             if let Some((_, ref items)) = m.content {
                 for item in items {
-                    collect_fn_infos(item, &mod_name, out);
+                    collect_fn_infos(item, &mod_name, local_macros, out);
                 }
             }
         }
@@ -820,11 +1109,13 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, out: &mut Vec<FnInf
 /// Returns a list of FnDependency records for every function in the file,
 /// showing which spec_fns (defined in this file) each one references.
 pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
-    fextract_verus_macro(filepath).map(|(files, _)| {
+    fextract_verus_macro(filepath).map(|(files, orig_file)| {
+        let local_macros = collect_local_macros(&files, &orig_file);
+
         let mut fn_infos: Vec<FnInfo> = Vec::new();
         for file in &files {
             for item in &file.items {
-                collect_fn_infos(item, "", &mut fn_infos);
+                collect_fn_infos(item, "", &local_macros, &mut fn_infos);
             }
         }
 
@@ -1707,6 +1998,267 @@ mod tests {
         let m = dep_map(&deps);
         assert_eq!(m["assert_req_user"], vec!["body_spec"],
             "spec_fn in assert expression should be detected");
+    }
+
+    // ── Local macro expansion ──────────────────────────────────────────
+
+    #[test]
+    fn macro_body_dep_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn return_one() -> nat { 1nat }
+                macro_rules! pow_macro {
+                    () => { return_one() }
+                }
+                spec fn pow(base: nat, exp: nat) -> nat
+                    decreases exp,
+                {
+                    if exp == 0 {
+                        pow_macro!()
+                    } else {
+                        base * pow(base, (exp - 1) as nat)
+                    }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        let mut d = m["pow"].clone();
+        d.sort();
+        assert_eq!(d, vec!["pow", "return_one"],
+            "macro body containing return_one() should be detected as a dep of pow");
+    }
+
+    #[test]
+    fn macro_body_no_false_dep_on_macro_name() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn helper() -> int { 1 }
+                macro_rules! my_macro {
+                    () => { helper() }
+                }
+                spec fn user() -> int {
+                    my_macro!()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["user"], vec!["helper"],
+            "macro expansion should add helper as a dep, not the macro name itself");
+    }
+
+    #[test]
+    fn macro_with_args_body_dep_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn combine(a: int, b: int) -> int { a + b }
+                macro_rules! combo {
+                    ($x:expr, $y:expr) => { combine($x, $y) }
+                }
+                spec fn caller() -> int {
+                    combo!(1, 2)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["caller"], vec!["combine"],
+            "macro with args should detect deps from macro body");
+    }
+
+    #[test]
+    fn macro_nested_in_if_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn inner() -> int { 42 }
+                macro_rules! wrap {
+                    () => { inner() }
+                }
+                spec fn nested_user(b: bool) -> int {
+                    if b { wrap!() } else { 0 }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["nested_user"], vec!["inner"],
+            "macro invoked inside if-expression should detect body deps");
+    }
+
+    #[test]
+    fn unknown_macro_does_not_panic() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn ext_user() -> int {
+                    some_external_macro!(1, 2, 3)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert!(m["ext_user"].is_empty(),
+            "external/unknown macros should not cause panics or false deps");
+    }
+
+    #[test]
+    fn multi_arm_macro_collects_all_bodies() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn branch_a() -> int { 1 }
+                spec fn branch_b() -> int { 2 }
+                macro_rules! multi {
+                    (a) => { branch_a() };
+                    (b) => { branch_b() };
+                }
+                spec fn multi_user() -> int {
+                    multi!(a)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        let mut d = m["multi_user"].clone();
+        d.sort();
+        // Best-effort: we scan ALL arms, so both are detected
+        assert_eq!(d, vec!["branch_a", "branch_b"],
+            "multi-arm macro should detect deps from all arms (best-effort)");
+    }
+
+    #[test]
+    fn macro_outside_verus_block_detected() {
+        // Macro defined outside verus!{}, used inside — should still expand
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            macro_rules! outer_mac {
+                () => { return_one() }
+            }
+            verus! {
+                spec fn return_one() -> nat { 1nat }
+                spec fn uses_outer(n: nat) -> nat {
+                    if n == 0 { outer_mac!() } else { n }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["uses_outer"], vec!["return_one"],
+            "macro defined outside verus block should be expanded for dep detection");
+    }
+
+    #[test]
+    fn nested_macro_transitive_dep() {
+        // inner_mac calls spec_fn, outer_mac calls inner_mac — should transitively detect
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn deep_dep() -> int { 42 }
+                macro_rules! inner_mac {
+                    () => { deep_dep() }
+                }
+                macro_rules! outer_mac {
+                    () => { inner_mac!() }
+                }
+                spec fn transitive_user() -> int {
+                    outer_mac!()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["transitive_user"], vec!["deep_dep"],
+            "nested macro invocation should transitively detect deep_dep");
+    }
+
+    #[test]
+    fn triple_nested_macro_transitive_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn leaf() -> int { 1 }
+                macro_rules! level1 {
+                    () => { leaf() }
+                }
+                macro_rules! level2 {
+                    () => { level1!() }
+                }
+                macro_rules! level3 {
+                    () => { level2!() }
+                }
+                spec fn deep_caller() -> int {
+                    level3!()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["deep_caller"], vec!["leaf"],
+            "three-level nested macros should transitively detect leaf dep");
+    }
+
+    #[test]
+    fn cyclic_macros_do_not_loop() {
+        // Macros that reference each other should not cause infinite loops
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn cyc_dep() -> int { 1 }
+                macro_rules! mac_a {
+                    () => { mac_b!() }
+                }
+                macro_rules! mac_b {
+                    () => { cyc_dep(); mac_a!() }
+                }
+                spec fn cyc_user() -> int {
+                    mac_a!()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["cyc_user"], vec!["cyc_dep"],
+            "cyclic macros should not infinite-loop and should still detect deps");
+    }
+
+    #[test]
+    fn qualified_path_in_macro_body_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                struct S;
+                impl S {
+                    spec fn s_spec() -> int { 1 }
+                }
+                macro_rules! qual_mac {
+                    () => { S::s_spec() }
+                }
+                proof fn qual_user() {
+                    let _ = qual_mac!();
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["qual_user"], vec!["S::s_spec"],
+            "qualified path Foo::bar() inside macro body should be detected");
+    }
+
+    #[test]
+    fn outer_macro_with_nested_inner() {
+        // Macro outside verus block calls a macro inside verus block
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            macro_rules! outer {
+                () => { inner!() }
+            }
+            verus! {
+                spec fn the_dep() -> int { 1 }
+                macro_rules! inner {
+                    () => { the_dep() }
+                }
+                spec fn chain_user() -> int {
+                    outer!()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["chain_user"], vec!["the_dep"],
+            "outer macro calling inner macro should transitively detect deps");
     }
 }
 
