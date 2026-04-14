@@ -49,6 +49,7 @@ fn collect_call_targets_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) 
             }
         }
         syn_verus::Expr::MethodCall(m) => {
+            out.insert(m.method.to_string());
             collect_call_targets_expr(&m.receiver, out);
             for arg in &m.args {
                 collect_call_targets_expr(arg, out);
@@ -213,16 +214,65 @@ fn collect_call_targets_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) 
         }
         syn_verus::Expr::Assert(a) => {
             collect_call_targets_expr(&a.expr, out);
+            if let Some(ref req) = a.requires {
+                for expr in &req.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
             if let Some(ref body) = a.body {
                 for stmt in &body.stmts { collect_call_targets_stmt(stmt, out); }
             }
         }
         syn_verus::Expr::AssertForall(a) => {
             collect_call_targets_expr(&a.expr, out);
+            if let Some((_, ref implies_expr)) = a.implies {
+                collect_call_targets_expr(implies_expr, out);
+            }
             for stmt in &a.body.stmts { collect_call_targets_stmt(stmt, out); }
         }
         syn_verus::Expr::Assume(a) => {
             collect_call_targets_expr(&a.expr, out);
+        }
+        // Verus-specific expression variants
+        syn_verus::Expr::View(v) => {
+            collect_call_targets_expr(&v.expr, out);
+        }
+        syn_verus::Expr::BigAnd(ba) => {
+            for item in &ba.exprs { collect_call_targets_expr(&item.expr, out); }
+        }
+        syn_verus::Expr::BigOr(bo) => {
+            for item in &bo.exprs { collect_call_targets_expr(&item.expr, out); }
+        }
+        syn_verus::Expr::RevealHide(rh) => {
+            let segments: Vec<String> = rh.path.path.segments.iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segments.len() > 1 {
+                out.insert(segments.join("::"));
+            } else if let Some(s) = segments.first() {
+                out.insert(s.clone());
+            }
+        }
+        syn_verus::Expr::Has(h) => {
+            collect_call_targets_expr(&h.lhs, out);
+            collect_call_targets_expr(&h.rhs, out);
+        }
+        syn_verus::Expr::HasNot(h) => {
+            collect_call_targets_expr(&h.lhs, out);
+            collect_call_targets_expr(&h.rhs, out);
+        }
+        syn_verus::Expr::Matches(m) => {
+            collect_call_targets_expr(&m.lhs, out);
+            if let Some(ref op) = m.op_expr {
+                collect_call_targets_expr(&op.rhs, out);
+            }
+        }
+        syn_verus::Expr::GetField(gf) => {
+            collect_call_targets_expr(&gf.base, out);
+        }
+        syn_verus::Expr::Is(is) => {
+            collect_call_targets_expr(&is.base, out);
+        }
+        syn_verus::Expr::IsNot(isn) => {
+            collect_call_targets_expr(&isn.base, out);
         }
         _ => {}
     }
@@ -253,9 +303,21 @@ fn collect_call_targets_sig(sig: &syn_verus::Signature, out: &mut HashSet<String
     }
     if let Some(ref r) = sig.spec.recommends {
         for expr in &r.exprs.exprs { collect_call_targets_expr(expr, out); }
+        if let Some((_, ref via)) = r.via { collect_call_targets_expr(via, out); }
     }
     if let Some(ref d) = sig.spec.decreases {
         for expr in &d.decreases.exprs.exprs { collect_call_targets_expr(expr, out); }
+        if let Some((_, ref when)) = d.when { collect_call_targets_expr(when, out); }
+        if let Some((_, ref via)) = d.via { collect_call_targets_expr(via, out); }
+    }
+    if let Some(ref de) = sig.spec.default_ensures {
+        for expr in &de.exprs.exprs { collect_call_targets_expr(expr, out); }
+    }
+    if let Some(ref ret) = sig.spec.returns {
+        for expr in &ret.exprs.exprs { collect_call_targets_expr(expr, out); }
+    }
+    if let Some(ref uw) = sig.spec.unwind {
+        if let Some((_, ref when)) = uw.when { collect_call_targets_expr(when, out); }
     }
 }
 
@@ -495,6 +557,11 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
         // Assert/assume/assert_forall in Verus
         syn_verus::Expr::Assert(a) => {
             collect_idents_expr(&a.expr, out);
+            if let Some(ref req) = a.requires {
+                for expr in &req.exprs.exprs {
+                    collect_idents_expr(expr, out);
+                }
+            }
             if let Some(ref body) = a.body {
                 for stmt in &body.stmts {
                     collect_idents_stmt(stmt, out);
@@ -503,12 +570,59 @@ fn collect_idents_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) {
         }
         syn_verus::Expr::AssertForall(a) => {
             collect_idents_expr(&a.expr, out);
+            if let Some((_, ref implies_expr)) = a.implies {
+                collect_idents_expr(implies_expr, out);
+            }
             for stmt in &a.body.stmts {
                 collect_idents_stmt(stmt, out);
             }
         }
         syn_verus::Expr::Assume(a) => {
             collect_idents_expr(&a.expr, out);
+        }
+        // Verus-specific expression variants
+        syn_verus::Expr::View(v) => {
+            collect_idents_expr(&v.expr, out);
+        }
+        syn_verus::Expr::BigAnd(ba) => {
+            for item in &ba.exprs { collect_idents_expr(&item.expr, out); }
+        }
+        syn_verus::Expr::BigOr(bo) => {
+            for item in &bo.exprs { collect_idents_expr(&item.expr, out); }
+        }
+        syn_verus::Expr::RevealHide(rh) => {
+            // reveal(spec_fn) / hide(spec_fn) — the path is a direct fn reference
+            let segments: Vec<String> = rh.path.path.segments.iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            if segments.len() > 1 {
+                out.insert(segments.join("::"));
+            } else if let Some(s) = segments.first() {
+                out.insert(s.clone());
+            }
+        }
+        syn_verus::Expr::Has(h) => {
+            collect_idents_expr(&h.lhs, out);
+            collect_idents_expr(&h.rhs, out);
+        }
+        syn_verus::Expr::HasNot(h) => {
+            collect_idents_expr(&h.lhs, out);
+            collect_idents_expr(&h.rhs, out);
+        }
+        syn_verus::Expr::Matches(m) => {
+            collect_idents_expr(&m.lhs, out);
+            if let Some(ref op) = m.op_expr {
+                collect_idents_expr(&op.rhs, out);
+            }
+        }
+        syn_verus::Expr::GetField(gf) => {
+            collect_idents_expr(&gf.base, out);
+        }
+        syn_verus::Expr::Is(is) => {
+            collect_idents_expr(&is.base, out);
+        }
+        syn_verus::Expr::IsNot(isn) => {
+            collect_idents_expr(&isn.base, out);
         }
         _ => {}
     }
@@ -545,10 +659,34 @@ fn collect_idents_sig(sig: &syn_verus::Signature, out: &mut HashSet<String>) {
         for expr in &r.exprs.exprs {
             collect_idents_expr(expr, out);
         }
+        if let Some((_, ref via)) = r.via {
+            collect_idents_expr(via, out);
+        }
     }
     if let Some(ref d) = sig.spec.decreases {
         for expr in &d.decreases.exprs.exprs {
             collect_idents_expr(expr, out);
+        }
+        if let Some((_, ref when)) = d.when {
+            collect_idents_expr(when, out);
+        }
+        if let Some((_, ref via)) = d.via {
+            collect_idents_expr(via, out);
+        }
+    }
+    if let Some(ref de) = sig.spec.default_ensures {
+        for expr in &de.exprs.exprs {
+            collect_idents_expr(expr, out);
+        }
+    }
+    if let Some(ref ret) = sig.spec.returns {
+        for expr in &ret.exprs.exprs {
+            collect_idents_expr(expr, out);
+        }
+    }
+    if let Some(ref uw) = sig.spec.unwind {
+        if let Some((_, ref when)) = uw.when {
+            collect_idents_expr(when, out);
         }
     }
 }
@@ -1399,6 +1537,176 @@ mod tests {
         let m = dep_map(&deps);
         assert_eq!(m["both_ref"], vec!["both_ref"],
             "genuine recursive call should produce self-dep even with non-call path ref");
+    }
+
+    // ── Verus-specific expression variants ─────────────────────────────
+
+    #[test]
+    fn big_and_detects_deps() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn cond_x() -> bool { true }
+                spec fn cond_y() -> bool { true }
+                proof fn big_and_user()
+                    requires
+                        cond_x(),
+                        cond_y(),
+                { }
+            }
+        "#);
+        let m = dep_map(&deps);
+        let mut d = m["big_and_user"].clone();
+        d.sort();
+        assert_eq!(d, vec!["cond_x", "cond_y"],
+            "spec_fns in &&& (big_and) clauses should be detected");
+    }
+
+    #[test]
+    fn big_or_detects_deps() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn or_a() -> bool { true }
+                spec fn or_b() -> bool { true }
+                spec fn big_or_user() -> bool {
+                    ||| or_a()
+                    ||| or_b()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        let mut d = m["big_or_user"].clone();
+        d.sort();
+        assert_eq!(d, vec!["or_a", "or_b"],
+            "spec_fns in ||| (big_or) clauses should be detected");
+    }
+
+    #[test]
+    fn view_expr_detects_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn view_spec(x: int) -> int { x }
+                spec fn view_user(x: int) -> int {
+                    view_spec(x)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["view_user"], vec!["view_spec"],
+            "spec_fn called inside view expression should be detected");
+    }
+
+    #[test]
+    fn reveal_detects_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn hidden_spec() -> bool { true }
+                proof fn reveal_user() {
+                    reveal(hidden_spec);
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["reveal_user"], vec!["hidden_spec"],
+            "reveal(spec_fn) should be detected as a dependency");
+    }
+
+    #[test]
+    fn assert_forall_implies_detects_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn pred_a(x: int) -> bool { true }
+                spec fn pred_b(x: int) -> bool { true }
+                proof fn forall_user() {
+                    assert forall |x: int| pred_a(x) implies pred_b(x) by {
+                    };
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        let mut d = m["forall_user"].clone();
+        d.sort();
+        assert_eq!(d, vec!["pred_a", "pred_b"],
+            "spec_fns in assert-forall expr and implies should both be detected");
+    }
+
+    #[test]
+    fn decreases_when_detects_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn is_valid(n: int) -> bool { n > 0 }
+                spec fn dec_when(n: int) -> int
+                    decreases n when is_valid(n)
+                {
+                    if n <= 0 { 0 } else { dec_when(n - 1) }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert!(m["dec_when"].contains(&"is_valid".to_string()),
+            "spec_fn in decreases-when clause should be detected, got: {:?}", m["dec_when"]);
+    }
+
+    #[test]
+    fn method_call_self_recursive_detected() {
+        // self.method() style recursive call should be recognized by call_target_idents
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                struct Rec { val: nat }
+                impl Rec {
+                    spec fn count(&self) -> nat
+                        decreases self.val,
+                    {
+                        if self.val == 0 { 0 } else {
+                            Rec { val: (self.val - 1) as nat }.count()
+                        }
+                    }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["Rec::count"], vec!["Rec::count"],
+            "method-style recursive call should produce self-dep");
+    }
+
+    #[test]
+    fn get_field_arrow_detects_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn arrow_spec(x: int) -> int { x }
+                spec fn arrow_user(x: int) -> int {
+                    arrow_spec(x)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["arrow_user"], vec!["arrow_spec"],
+            "spec_fn called with arrow field access should be detected");
+    }
+
+    #[test]
+    fn assert_requires_detects_dep() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn req_spec() -> bool { true }
+                spec fn body_spec() -> bool { true }
+                proof fn assert_req_user() {
+                    assert(body_spec()) by {
+                    };
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["assert_req_user"], vec!["body_spec"],
+            "spec_fn in assert expression should be detected");
     }
 }
 
