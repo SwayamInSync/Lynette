@@ -133,7 +133,7 @@ spec_fn:owner_reference_to_object_reference (free function)
 
 ## `lynette deps` — Compute Function Dependencies
 
-**Added command.** Performs AST-level dependency analysis on a Verus source file. For each function, reports which `spec_fn`s (defined in the same file) it references — by walking the function's body and signature spec clauses (requires, ensures, recommends, decreases) and collecting all referenced identifiers.
+**Added command.** Performs AST-level dependency analysis on a Verus source file. For each function, reports which `spec_fn`s (defined in the same file) it references — by walking the function's body and signature spec clauses and collecting all referenced identifiers, including through local macro expansion.
 
 ```bash
 lynette deps [OPTIONS] <FILE>
@@ -190,12 +190,127 @@ lynette deps -j -f proof_fn --non-empty file.rs
 
 ### How It Works
 
-1. Parses the file with `syn_verus` and collects all function definitions (free functions, impl methods, trait methods, and functions inside inline modules)
-2. For each function, walks the AST of its body and signature spec clauses to collect all referenced identifiers (function calls, method calls, path references). Nested `fn` items inside a function body are **not** descended into — their references belong to the nested function, not the enclosing one. Struct constructors (e.g. `Foo { x: 1 }`) are skipped to avoid false positives from type names matching `spec_fn` names.
-3. Cross-references those identifiers against the set of `spec_fn` / `spec(checked)` functions defined in the same file
-4. For qualified references (e.g. `Foo::bar`), matches directly against known spec_fns. For bare names (e.g. `bar`), applies a **same-impl preference heuristic**: if the calling function is inside `impl Foo`, only `Foo::bar` is matched; otherwise all spec_fns with that bare name are included. Path prefixes `crate::`, `self::`, `super::`, and `Self::` are stripped to the bare last segment before matching — so `Self::bar()` inside `impl Foo` correctly resolves to `Foo::bar`.
-5. **Self-references (recursion):** A function is listed as depending on itself only when it genuinely calls itself (i.e. its name appears in `func(...)` call position). A separate call-target analysis prevents false self-deps from non-call path references (e.g. a let binding that happens to share the function's name). Calls written with `crate::`, `self::`, `super::`, or `Self::` prefixes are also recognized. Note: this is purely syntactic — a local binding (e.g. a closure) called as `name(...)` that shadows a function name will still be treated as a call target.
-6. Reports matches using qualified names (e.g. `Foo::bar`) when available, or bare names (e.g. `bar`) otherwise
+#### 1. Parsing & Collection
+
+The file is parsed with `syn_verus`. All function definitions are collected — free functions, impl methods, trait methods, and functions inside inline modules. Each function is represented as a `FnInfo` record containing:
+
+- **`name`** — fully-qualified name (e.g. `Foo::bar`, `inner::my_fn`)
+- **`kind`** — the function mode (`spec_fn`, `proof_fn`, `exec_fn`, etc.)
+- **`referenced_idents`** — all identifiers and paths referenced anywhere in the function
+- **`call_target_idents`** — only identifiers appearing in call position (`func(...)`, `obj.method(...)`)
+- **`impl_type`** — the parent type for methods inside `impl` blocks
+
+#### 2. AST Walking
+
+Two parallel AST walkers traverse each function's body and signature:
+
+- **`collect_idents_expr`** collects *all* referenced identifiers (used for cross-function dependency matching)
+- **`collect_call_targets_expr`** collects *only call-position* identifiers (used for self-reference detection)
+
+**Handled expression types:**
+
+| Category | Expressions |
+|---|---|
+| **Calls** | `Call` (`foo(x)`), `MethodCall` (`x.foo()`) |
+| **Paths** | `Path` (`foo`, `Foo::bar`) |
+| **Operators** | `Binary` (`a + b`), `Unary` (`!x`) |
+| **Control flow** | `If`, `Match`, `While`, `ForLoop`, `Loop`, `Break`, `Return` |
+| **Blocks** | `Block`, `TryBlock`, `Closure` |
+| **Data** | `Tuple`, `Array`, `Repeat`, `Struct` (field values only — see below), `Field`, `Index`, `GetField` (`->` accessor) |
+| **Misc** | `Paren`, `Group`, `Reference`, `Cast`, `Assign`, `Range`, `Try` (`?`), `Yield`, `Let` |
+| **Verus-specific** | `Assert` (including `.requires` and `by` block), `AssertForall` (including `.implies`), `Assume`, `View` (`.view()`), `BigAnd` (`&&&`), `BigOr` (`\|\|\|`), `RevealHide` (`reveal`/`hide`), `Has`, `HasNot`, `Matches`, `Is`, `IsNot` |
+
+**Struct constructors** (e.g. `Foo { x: 1 }`) are a special case: the type path is *not* collected as an identifier (to avoid false positives from type names matching `spec_fn` names), but field value expressions *are* walked.
+
+**Nested `fn` items** inside a function body are *not* descended into — their references belong to the nested function, not the enclosing one.
+
+#### 3. Signature Spec Clause Walking
+
+Both walkers also traverse the function signature's spec clauses:
+
+| Clause | Fields traversed |
+|---|---|
+| `requires` | All expressions |
+| `ensures` | All expressions |
+| `recommends` | All expressions + `via` |
+| `decreases` | All expressions + `when` + `via` |
+| `default_ensures` | All expressions |
+| `returns` | All expressions |
+| `unwind` | `when` expression |
+
+Loop spec clauses (`invariant`, `invariant_ensures`, `invariant_except_break`, `ensures`, `decreases`) inside `while`, `for`, and `loop` expressions are also traversed.
+
+Closure spec clauses (`requires`, `ensures`, `decreases`) are traversed as well.
+
+#### 4. Local Macro Expansion
+
+`macro_rules!` definitions are collected from the **entire file** — both inside and outside `verus!{}` blocks — and used for token-level dependency scanning.
+
+**How it works:**
+
+1. **Collection**: All `macro_rules!` definitions are gathered into a map of `macro_name → Vec<arm_bodies>`. Multi-arm macros have all arms collected.
+
+2. **Detection**: For each function, the body and signature are converted to a token stream. Any `name!` invocations matching a local macro are detected.
+
+3. **Transitive expansion**: Macro bodies may themselves invoke other local macros. A worklist algorithm with cycle detection computes the transitive closure of all macros reachable from the function's direct invocations.
+
+4. **Scanning**: All reachable macro arm bodies are token-scanned for identifiers and call targets. This includes qualified paths like `Foo::bar()`. Discovered identifiers are added to the function's `referenced_idents` and `call_target_idents`.
+
+**Example:**
+```rust
+macro_rules! my_macro {
+    () => { helper_spec() };
+}
+
+verus! {
+    spec fn helper_spec() -> bool { true }
+    proof fn my_proof() {
+        my_macro!();  // → dependency on helper_spec detected
+    }
+}
+```
+
+Nested macros also work:
+```rust
+macro_rules! inner { () => { helper_spec() }; }
+macro_rules! outer { () => { inner!() }; }
+
+verus! {
+    proof fn my_proof() {
+        outer!();  // → dependency on helper_spec detected (via inner)
+    }
+}
+```
+
+#### 5. Dependency Resolution
+
+Collected identifiers are cross-referenced against the set of `spec_fn` / `spec_checked_fn` definitions in the file.
+
+**Qualified references** (e.g. `Foo::bar`) are matched directly against known spec_fns.
+
+**Bare names** (e.g. `bar`) use a **same-impl preference heuristic**:
+- If the calling function is inside `impl Foo`, only `Foo::bar` is matched
+- If no same-impl candidate exists, or the caller is a free function, **all** spec_fns with that bare name are included (conservative fallback)
+
+**Path prefix normalization**: `crate::`, `self::`, `super::`, and `Self::` prefixes are stripped to the bare last segment before matching — so `Self::bar()` inside `impl Foo` correctly resolves to `Foo::bar`.
+
+#### 6. Self-Reference (Recursion) Detection
+
+A function is listed as depending on itself **only** when it genuinely calls itself — i.e. its name appears in call-target position (`func(...)` or `self.func(...)`). The dual-set approach (all idents vs. call-target idents) prevents false self-deps from non-call path references.
+
+**Recognized self-call patterns:**
+- `recur(n - 1)` — direct name
+- `Self::recur(n - 1)` — Self-qualified
+- `self::recur(n - 1)` — module-qualified
+- `crate::recur(n - 1)` — crate-qualified
+- `super::recur(n - 1)` — parent-module-qualified
+- `self.recur(n - 1)` — method call
+
+> **Note:** This is purely syntactic — a local binding (e.g. a closure) called as `name(...)` that shadows a function name will still be treated as a self-call.
+
+#### 7. Output
+
+Dependencies are reported using qualified names (e.g. `Foo::bar`) when available, or bare names (e.g. `bar`) otherwise. Results are sorted by function name.
 
 ### Scope
 
@@ -203,17 +318,23 @@ The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, 
 
 ### Naming
 
-Impl method names always use `Type::method`, regardless of whether the impl is inherent or a trait impl. This matches the naming used by `lynette list` and ensures the same-impl heuristic works correctly.
+- **Impl methods** always use `Type::method`, regardless of whether the impl is inherent or a trait impl (`impl Trait for Foo` → `Foo::method`). This matches the naming used by `lynette list`.
+- **Inline module functions** are qualified with the module path: `inner::my_fn`.
+- **Free functions** use their bare name.
 
 ### Limitations
 
-- Only detects references to `spec_fn`s defined **in the same file** — cross-file dependencies are not tracked.
-- Without full type resolution, bare method calls like `self.val()` are resolved heuristically:
-  - If the calling function is inside `impl Foo`, only `Foo::val` is matched (same-impl preference).
-  - If no same-impl candidate exists, or the caller is a free function, **all** `spec_fn`s named `val` in the file are matched (conservative fallback).
-  - This covers the common case correctly but can still over-approximate when a method calls a same-named `spec_fn` from a *different* impl via a field or argument.
-- Variable names that coincide with a `spec_fn` name can cause false positives when the variable is used as an expression (e.g. `let x = len;` where `spec fn len()` exists). Pattern bindings (`let len = 5;`) are **not** affected.
-- Macro invocations and `unsafe` blocks are not traversed — references to `spec_fn`s inside them will be missed.
+| Limitation | Impact | Workaround |
+|---|---|---|
+| **Same-file only** | Cross-file dependencies (imports, external crates) are not tracked | N/A — would require multi-file analysis |
+| **No type resolution** | Bare method calls like `self.val()` are resolved heuristically (same-impl preference, then conservative fallback) | Use explicit qualified paths (`Foo::val()`) when precision matters |
+| **Variable name collisions** | A variable used as an expression that shares a `spec_fn` name creates a false positive (`let x = len;` where `spec fn len()` exists). Pattern bindings (`let len = 5;`) are *not* affected | Avoid naming variables after spec_fns |
+| **Parameter name collisions** | A function parameter sharing a spec_fn name creates a false positive (e.g. `fn caller(helper_spec: int)`) | Rename the parameter |
+| **Macro expansion is token-level** | No actual substitution — macro patterns/metavariables are not expanded. Token scanning may miss deps hidden behind complex token manipulation | Keep macro bodies straightforward |
+| **Multi-arm macros over-approximate** | All arms of a `macro_rules!` are scanned regardless of which arm is actually matched | Acceptable — only causes false positives, not missed deps |
+| **External macros opaque** | Only locally-defined `macro_rules!` are expanded; `use`-imported or proc-macros are not | Define wrapper macros locally if needed |
+| **`use` aliases not tracked** | `use Foo as Bar; Bar::method()` won't resolve to `Foo::method` | Use original names |
+| **`unsafe` blocks not traversed** | References inside `unsafe { ... }` blocks are missed | N/A |
 
 ---
 
