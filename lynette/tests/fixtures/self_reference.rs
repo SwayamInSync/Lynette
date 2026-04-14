@@ -16,7 +16,9 @@ proof fn self_ref_proof()
 }
 
 // --- Parameter shadowing: parameter named same as a spec_fn ---
-// Should NOT list helper_spec as a self-dep even though param name matches.
+// Known limitation: `shadowed_param` will report a false-positive dependency
+// on `helper_spec` because the parameter name matches the spec_fn name and
+// cross-function dep detection operates on all path expressions.
 spec fn helper_spec(x: int) -> int {
     x + 1
 }
@@ -34,10 +36,12 @@ spec fn recursive_with_dep(s: Seq<int>) -> int
     else { helper_spec(s.first()) + recursive_with_dep(s.drop_first()) }
 }
 
-// --- Non-recursive spec fn that mentions its own name only in a let binding ---
-// (the let binding creates a variable, but `non_call_self_ref` also appears
-// as a path expression on the RHS — should NOT self-dep since it's not a call)
+// --- Non-recursive spec fn whose own name appears as a path but NOT as a call ---
+// `non_call_self_ref` is referenced via a let binding (path expression), so it
+// shows up in referenced_idents but NOT in call_target_idents. The self-dep
+// filtering should therefore exclude it from its own depends_on list.
 spec fn non_call_self_ref(x: int) -> int {
+    let _shadow: int = if x > 0 { non_call_self_ref } else { 0 };
     helper_spec(x)
 }
 

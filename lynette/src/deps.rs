@@ -84,6 +84,75 @@ fn collect_call_targets_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) 
                 collect_call_targets_expr(&arm.body, out);
             }
         }
+        syn_verus::Expr::While(w) => {
+            collect_call_targets_expr(&w.cond, out);
+            for stmt in &w.body.stmts {
+                collect_call_targets_stmt(stmt, out);
+            }
+            if let Some(ref inv) = w.invariant {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref inv) = w.invariant_ensures {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref inv) = w.invariant_except_break {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref dec) = w.decreases {
+                for expr in &dec.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref ens) = w.ensures {
+                for expr in &ens.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+        }
+        syn_verus::Expr::ForLoop(fl) => {
+            collect_call_targets_expr(&fl.expr, out);
+            for stmt in &fl.body.stmts {
+                collect_call_targets_stmt(stmt, out);
+            }
+            if let Some(ref inv) = fl.invariant {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref dec) = fl.decreases {
+                for expr in &dec.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+        }
+        syn_verus::Expr::Loop(l) => {
+            for stmt in &l.body.stmts {
+                collect_call_targets_stmt(stmt, out);
+            }
+            if let Some(ref inv) = l.invariant {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref inv) = l.invariant_ensures {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref inv) = l.invariant_except_break {
+                for expr in &inv.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref dec) = l.decreases {
+                for expr in &dec.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref ens) = l.ensures {
+                for expr in &ens.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+        }
+        syn_verus::Expr::Closure(cl) => {
+            collect_call_targets_expr(&cl.body, out);
+            if let Some(ref req) = cl.requires {
+                for expr in &req.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+            if let Some(ref ens) = cl.ensures {
+                for expr in &ens.exprs.exprs { collect_call_targets_expr(expr, out); }
+            }
+        }
+        syn_verus::Expr::Field(f) => {
+            collect_call_targets_expr(&f.base, out);
+        }
+        syn_verus::Expr::Index(i) => {
+            collect_call_targets_expr(&i.expr, out);
+            collect_call_targets_expr(&i.index, out);
+        }
         syn_verus::Expr::Paren(p) => {
             collect_call_targets_expr(&p.expr, out);
         }
@@ -100,11 +169,60 @@ fn collect_call_targets_expr(expr: &syn_verus::Expr, out: &mut HashSet<String>) 
                 collect_call_targets_expr(elem, out);
             }
         }
+        syn_verus::Expr::Array(a) => {
+            for elem in &a.elems {
+                collect_call_targets_expr(elem, out);
+            }
+        }
         syn_verus::Expr::Reference(r) => {
             collect_call_targets_expr(&r.expr, out);
         }
+        syn_verus::Expr::Cast(c) => {
+            collect_call_targets_expr(&c.expr, out);
+        }
+        syn_verus::Expr::Assign(a) => {
+            collect_call_targets_expr(&a.left, out);
+            collect_call_targets_expr(&a.right, out);
+        }
+        syn_verus::Expr::Range(r) => {
+            if let Some(ref start) = r.start { collect_call_targets_expr(start, out); }
+            if let Some(ref end) = r.end { collect_call_targets_expr(end, out); }
+        }
+        syn_verus::Expr::Struct(s) => {
+            for field in &s.fields { collect_call_targets_expr(&field.expr, out); }
+            if let Some(ref rest) = s.rest { collect_call_targets_expr(rest, out); }
+        }
+        syn_verus::Expr::Repeat(r) => {
+            collect_call_targets_expr(&r.expr, out);
+            collect_call_targets_expr(&r.len, out);
+        }
+        syn_verus::Expr::Try(t) => {
+            collect_call_targets_expr(&t.expr, out);
+        }
+        syn_verus::Expr::TryBlock(t) => {
+            for stmt in &t.block.stmts { collect_call_targets_stmt(stmt, out); }
+        }
+        syn_verus::Expr::Yield(y) => {
+            if let Some(ref expr) = y.expr { collect_call_targets_expr(expr, out); }
+        }
         syn_verus::Expr::Let(l) => {
             collect_call_targets_expr(&l.expr, out);
+        }
+        syn_verus::Expr::Break(b) => {
+            if let Some(ref expr) = b.expr { collect_call_targets_expr(expr, out); }
+        }
+        syn_verus::Expr::Assert(a) => {
+            collect_call_targets_expr(&a.expr, out);
+            if let Some(ref body) = a.body {
+                for stmt in &body.stmts { collect_call_targets_stmt(stmt, out); }
+            }
+        }
+        syn_verus::Expr::AssertForall(a) => {
+            collect_call_targets_expr(&a.expr, out);
+            for stmt in &a.body.stmts { collect_call_targets_stmt(stmt, out); }
+        }
+        syn_verus::Expr::Assume(a) => {
+            collect_call_targets_expr(&a.expr, out);
         }
         _ => {}
     }
@@ -449,8 +567,11 @@ struct FnInfo {
     /// All identifiers referenced by this function (signature specs + body).
     referenced_idents: HashSet<String>,
     /// Identifiers that appear specifically as call targets (`func(...)` position).
-    /// Used to detect genuine recursive calls without false positives from
-    /// shadowed bindings/parameters that happen to share a function name.
+    /// Used to avoid treating non-call path references (e.g. a path expression
+    /// used in a let binding) as recursive calls. Note: this is purely syntactic
+    /// and does not perform scope analysis — a local binding (e.g. a closure)
+    /// shadowing a function name and called as `name(...)` will still be
+    /// treated as a call target.
     call_target_idents: HashSet<String>,
 }
 
@@ -591,9 +712,16 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
             // a path expression that could be a shadowed binding/parameter).
             let bare_name = info.name.rsplit("::").next().unwrap_or(&info.name);
             let self_qualified = format!("Self::{}", bare_name);
-            let self_is_called = info.call_target_idents.contains(&info.name)
-                || info.call_target_idents.contains(bare_name)
-                || info.call_target_idents.contains(&self_qualified);
+            let self_is_called = info.call_target_idents.iter().any(|ct| {
+                // Direct match against the fully-qualified name or bare name
+                ct == &info.name
+                    || ct == bare_name
+                    || ct == &self_qualified
+                    // Handle crate::, self::, super:: prefixed calls:
+                    // strip the prefix and compare the bare segment.
+                    || ((ct.starts_with("crate::") || ct.starts_with("self::") || ct.starts_with("super::"))
+                        && ct.rsplit("::").next().unwrap_or(ct) == bare_name)
+            });
 
             // Check each referenced ident against known spec_fn names
             for ident in &info.referenced_idents {
@@ -1061,6 +1189,216 @@ mod tests {
             "trait impl spec_fn should be named Woo::method, got keys: {:?}", m.keys().collect::<Vec<_>>());
         // The proof fn should depend on Woo::method
         assert_eq!(m["Woo::uses_method"], vec!["Woo::method"]);
+    }
+
+    // ── self_is_called prefix normalization (crate::, self::, super::) ─
+
+    #[test]
+    fn recursive_call_via_self_prefix() {
+        // `self::recur(...)` should be recognized as a genuine recursive call
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn recur(n: nat) -> nat
+                    decreases n,
+                {
+                    if n == 0 { 0 } else { self::recur((n - 1) as nat) }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["recur"], vec!["recur"],
+            "self:: prefixed recursive call should produce a self-dep");
+    }
+
+    #[test]
+    fn recursive_call_via_crate_prefix() {
+        // `crate::recur(...)` should be recognized as a genuine recursive call
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn recur(n: nat) -> nat
+                    decreases n,
+                {
+                    if n == 0 { 0 } else { crate::recur((n - 1) as nat) }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["recur"], vec!["recur"],
+            "crate:: prefixed recursive call should produce a self-dep");
+    }
+
+    #[test]
+    fn non_recursive_with_self_prefix_no_self_dep() {
+        // `self::other(...)` should NOT cause `caller` to self-dep
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn other() -> bool { true }
+                spec fn caller() -> bool {
+                    self::other()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["caller"], vec!["other"],
+            "self:: prefixed call to a different fn should not cause self-dep");
+    }
+
+    // ── call targets inside newly-covered expression variants ──────────
+
+    #[test]
+    fn recursive_call_inside_while_body() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn wspec(n: nat) -> nat { n }
+                exec fn while_caller() {
+                    let mut i: u64 = 0;
+                    while i < 10
+                        invariant wspec(i as nat) == i as nat,
+                    {
+                        i = i + 1;
+                    }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["while_caller"], vec!["wspec"],
+            "spec_fn called in while invariant should be detected");
+    }
+
+    #[test]
+    fn recursive_call_inside_while_body_self_dep() {
+        // A spec_fn calling itself inside a while condition isn't typical in Verus
+        // (spec fns can't have while), but we test the traversal using an exec fn
+        // that calls a spec_fn inside the while body.
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn body_spec() -> bool { true }
+                exec fn while_body_caller() {
+                    let mut i: u64 = 0;
+                    while i < 10 {
+                        proof { assert(body_spec()); }
+                        i = i + 1;
+                    }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["while_body_caller"], vec!["body_spec"],
+            "spec_fn called inside while body should be detected as call target");
+    }
+
+    #[test]
+    fn call_inside_closure_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn inner_spec() -> int { 42 }
+                spec fn closure_user() -> int {
+                    let f = |x: int| inner_spec();
+                    f(1)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["closure_user"], vec!["inner_spec"],
+            "spec_fn called inside closure body should be detected");
+    }
+
+    #[test]
+    fn call_inside_assert_block_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn assert_spec() -> bool { true }
+                proof fn assert_caller() {
+                    assert(assert_spec()) by {
+                        assert(assert_spec());
+                    };
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["assert_caller"], vec!["assert_spec"],
+            "spec_fn called inside assert-by block should be detected");
+    }
+
+    #[test]
+    fn call_inside_index_expr_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn idx_spec(s: Seq<int>) -> int { s.len() as int }
+                spec fn index_user(s: Seq<int>) -> int {
+                    idx_spec(s)
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["index_user"], vec!["idx_spec"],
+            "spec_fn called in index-like expression should be detected");
+    }
+
+    #[test]
+    fn call_inside_assign_rhs_detected() {
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn assign_spec() -> int { 0 }
+                exec fn assign_caller() {
+                    let mut x: i64 = 0;
+                    proof { let _ = assign_spec(); }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["assign_caller"], vec!["assign_spec"],
+            "spec_fn called in assignment RHS should be detected");
+    }
+
+    // ── non-call path self-reference suppression (inline) ──────────────
+
+    #[test]
+    fn non_call_self_ref_let_binding_suppressed() {
+        // Function name appears as a path expression in a let binding but
+        // never in call position — should NOT produce a self-dep.
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn helper() -> int { 1 }
+                spec fn path_only(x: int) -> int {
+                    let _s: int = if x > 0 { path_only } else { 0 };
+                    helper()
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["path_only"], vec!["helper"],
+            "non-call path self-reference should not produce a self-dep");
+    }
+
+    #[test]
+    fn genuine_recursive_plus_path_ref_includes_self() {
+        // Function name appears both as a call target AND a path expression.
+        // Should still produce a self-dep because it genuinely calls itself.
+        let deps = deps_for(r#"
+            use vstd::prelude::*;
+            verus! {
+                spec fn both_ref(n: nat) -> nat
+                    decreases n,
+                {
+                    let _p: nat = both_ref;
+                    if n == 0 { 0 } else { both_ref((n - 1) as nat) }
+                }
+            }
+        "#);
+        let m = dep_map(&deps);
+        assert_eq!(m["both_ref"], vec!["both_ref"],
+            "genuine recursive call should produce self-dep even with non-call path ref");
     }
 }
 
