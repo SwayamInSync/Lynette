@@ -361,16 +361,34 @@ lynette compare [OPTIONS] <FILE1> <FILE2>
 
 | Flag | Description |
 |---|---|
-| `-t, --target` | Enables `--requires --ensures --assumes --decreases` together |
+| `-t, --target` | *(Deprecated)* Enables `--requires --ensures --assumes --decreases` together |
+| `--spec-mode` | Enable all spec-related flags (`--spec --requires --ensures --recommends --decreases`) |
+| `--proof-mode` | Enable all proof-related flags (`--proof --invariants --asserts --assert-forall --assumes --proof-block`) |
 | `--requires` | Also compare `requires` clauses |
 | `--ensures` | Also compare `ensures` clauses |
-| `--invariants` | Also compare loop invariants |
-| `--spec` | Also compare spec functions |
+| `--recommends` | Also compare `recommends` clauses |
+| `--invariants` | Also compare loop invariants (`invariant`, `invariant_ensures`, `invariant_except_break`) |
+| `--spec` | Also compare spec functions (`spec fn`, `spec(checked) fn`) |
+| `--proof` | Also compare proof functions (`proof fn`, `proof(axiom) fn`) |
 | `--asserts` | Also compare assert statements |
+| `--assert-forall` | Also compare `assert forall` expressions |
 | `--asserts-anno` | Also compare asserts with annotations (e.g. `#[warn(llm_do_not_change)]`) |
 | `--decreases` | Also compare decreases clauses |
 | `--assumes` | Also compare assume statements |
+| `--proof-block` | Also compare inline `proof { ... }` blocks |
 | `-v, --verbose` | Print both files after deghosting to stdout |
+
+### Ghost Code Categories
+
+The flags map to these Verus constructs:
+
+| Category | Kinds | Flags |
+|---|---|---|
+| **Spec function kinds** | `spec fn`, `spec(checked) fn` | `--spec` (or `--spec-mode`) |
+| **Spec clause kinds** | `requires`, `ensures`, `recommends`, `decreases` | `--requires`, `--ensures`, `--recommends`, `--decreases` (or `--spec-mode`) |
+| **Proof function kinds** | `proof fn`, `proof(axiom) fn` | `--proof` (or `--proof-mode`) |
+| **Proof clause kinds** | `invariant`, `invariant_ensures`, `invariant_except_break`, `assert`, `assert forall`, `assume`, `proof { ... }` | `--invariants`, `--asserts`, `--assert-forall`, `--assumes`, `--proof-block` (or `--proof-mode`) |
+| **Exec function kinds** | `exec fn`, `fn` | Always retained (never stripped) |
 
 ### Example
 
@@ -381,8 +399,18 @@ lynette compare file1.rs file2.rs
 # Compare including requires and ensures (but still ignoring asserts, invariants, etc.)
 lynette compare --requires --ensures file1.rs file2.rs
 
+# Compare with all spec-related ghost code preserved
+lynette compare --spec-mode file1.rs file2.rs
+
+# Compare with all proof-related ghost code preserved
+lynette compare --proof-mode file1.rs file2.rs
+
 # Compare everything including all ghost code
-lynette compare --requires --ensures --invariants --spec --asserts --decreases --assumes file1.rs file2.rs
+lynette compare --spec-mode --proof-mode file1.rs file2.rs
+
+# Or equivalently, enable each flag individually
+lynette compare --spec --proof --requires --ensures --recommends --invariants \
+  --asserts --assert-forall --decreases --assumes --proof-block file1.rs file2.rs
 ```
 
 ---
