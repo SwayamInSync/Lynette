@@ -175,30 +175,42 @@ pub struct DeghostMode {
     requires: bool,
     #[clap(long, help = "Compare ensures")]
     ensures: bool,
-    #[clap(long, help = "Compare invariants")]
+    #[clap(long, help = "Compare recommends")]
+    recommends: bool,
+    #[clap(long, help = "Compare invariants (sig-level and loop invariants)")]
     invariants: bool,
     #[clap(long, help = "Compare spec functions")]
     spec: bool,
+    #[clap(long, help = "Compare proof functions")]
+    proof: bool,
     #[clap(long, help = "Compare asserts")]
     asserts: bool,
+    #[clap(long, help = "Compare assert_forall expressions")]
+    assert_forall: bool,
     #[clap(long, help = "Compare asserts with annotations(e.g. #[warn(llm_do_not_change)])")]
     asserts_anno: bool,
     #[clap(long, help = "Compare decreases")]
     decreases: bool,
     #[clap(long, help = "Compare assumes")]
     assumes: bool,
+    #[clap(long, help = "Compare proof blocks")]
+    proof_block: bool,
 }
 
 impl DeghostMode {
     pub fn replace_with(&mut self, other: &DeghostMode) {
         self.requires = other.requires;
         self.ensures = other.ensures;
+        self.recommends = other.recommends;
         self.invariants = other.invariants;
         self.spec = other.spec;
+        self.proof = other.proof;
         self.asserts = other.asserts;
+        self.assert_forall = other.assert_forall;
         self.asserts_anno = other.asserts_anno;
         self.decreases = other.decreases;
         self.assumes = other.assumes;
+        self.proof_block = other.proof_block;
     }
 }
 
@@ -212,12 +224,16 @@ impl Default for DeghostMode {
         Self {
             requires: false,
             ensures: false,
+            recommends: false,
             invariants: false,
             spec: false,
+            proof: false,
             asserts: false,
+            assert_forall: false,
             asserts_anno: false,
             decreases: false,
             assumes: false,
+            proof_block: false,
         }
     }
 }
@@ -253,6 +269,12 @@ struct CompareArgs {
  This flag may be extended futher in the future."
     )]
     target: bool,
+
+    #[clap(long, help = "Enable all spec-related flags (spec, requires, ensures, recommends, decreases)")]
+    spec_mode: bool,
+
+    #[clap(long, help = "Enable all proof-related flags (proof, invariants, asserts, assert-forall, assumes, proof-block)")]
+    proof_mode: bool,
 
     #[clap(flatten)]
     opts: DeghostMode,
@@ -516,18 +538,31 @@ fn compare_files(args: &CompareArgs) -> Result<bool, Error> {
 
     let target_mode = args.target;
 
-    let mode = if target_mode {
-        let mut m = args.opts.clone();
+    let mut mode = args.opts.clone();
 
-        m.requires = true;
-        m.ensures = true;
-        m.assumes = true;
-        m.decreases = true;
+    if target_mode {
+        mode.requires = true;
+        mode.ensures = true;
+        mode.assumes = true;
+        mode.decreases = true;
+    }
 
-        m
-    } else {
-        args.opts.clone()
-    };
+    if args.spec_mode {
+        mode.spec = true;
+        mode.requires = true;
+        mode.ensures = true;
+        mode.recommends = true;
+        mode.decreases = true;
+    }
+
+    if args.proof_mode {
+        mode.proof = true;
+        mode.invariants = true;
+        mode.asserts = true;
+        mode.assert_forall = true;
+        mode.assumes = true;
+        mode.proof_block = true;
+    }
 
     fextract_pure_rust(f1, &mode).and_then(|result1| {
         fextract_pure_rust(f2, &mode).and_then(|result2| {

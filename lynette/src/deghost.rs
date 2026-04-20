@@ -123,11 +123,11 @@ fn remove_ghost_expr(expr: &syn_verus::Expr, mode: &DeghostMode) -> Option<syn_v
                     while_token: w.while_token.clone(),
                     cond: w.cond.clone(),
                     body: new_body,
-                    invariant_except_break: None, // Removed
-                    invariant: None,              // Removed
-                    invariant_ensures: None,      // Removed
-                    ensures: None,                // Removed
-                    decreases: None,              // Removed
+                    invariant_except_break: if mode.invariants { w.invariant_except_break.clone() } else { None },
+                    invariant: if mode.invariants { w.invariant.clone() } else { None },
+                    invariant_ensures: if mode.invariants { w.invariant_ensures.clone() } else { None },
+                    ensures: if mode.ensures { w.ensures.clone() } else { None },
+                    decreases: if mode.decreases { w.decreases.clone() } else { None },
                 })
             })
         }
@@ -147,8 +147,8 @@ fn remove_ghost_expr(expr: &syn_verus::Expr, mode: &DeghostMode) -> Option<syn_v
                     expr: f.expr.clone(),
                     body: new_body,
                     expr_name: f.expr_name.clone(),
-                    invariant: None, // Removed
-                    decreases: None, // Removed
+                    invariant: if mode.invariants { f.invariant.clone() } else { None },
+                    decreases: if mode.decreases { f.decreases.clone() } else { None },
                 })
             })
         }
@@ -161,8 +161,14 @@ fn remove_ghost_expr(expr: &syn_verus::Expr, mode: &DeghostMode) -> Option<syn_v
                  * Exists
                  * Choose
                  */
-                syn_verus::UnOp::Proof(_)
-                | syn_verus::UnOp::Forall(_)
+                syn_verus::UnOp::Proof(_) => {
+                    if mode.proof_block {
+                        Some(expr.clone())
+                    } else {
+                        None
+                    }
+                }
+                syn_verus::UnOp::Forall(_)
                 | syn_verus::UnOp::Exists(_)
                 | syn_verus::UnOp::Choose(_) => None,
                 _ => Some(expr.clone()),
@@ -239,9 +245,21 @@ fn remove_ghost_expr(expr: &syn_verus::Expr, mode: &DeghostMode) -> Option<syn_v
                 None
             }
         }
-        syn_verus::Expr::Assume(..)
-        | syn_verus::Expr::AssertForall(..)
-        | syn_verus::Expr::RevealHide(..)
+        syn_verus::Expr::Assume(..) => {
+            if mode.assumes {
+                Some(expr.clone())
+            } else {
+                None
+            }
+        }
+        syn_verus::Expr::AssertForall(..) => {
+            if mode.assert_forall {
+                Some(expr.clone())
+            } else {
+                None
+            }
+        }
+        syn_verus::Expr::RevealHide(..)
         | syn_verus::Expr::View(..)
         | syn_verus::Expr::BigAnd(..)
         | syn_verus::Expr::BigOr(..)
@@ -303,7 +321,7 @@ pub fn remove_ghost_sig(
      */
     if (!mode.spec
         && matches!(sig.mode, syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_)))
-        || matches!(sig.mode, syn_verus::FnMode::Proof(_))
+        || (!mode.proof && matches!(sig.mode, syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_)))
     {
         return None;
     }
@@ -347,7 +365,7 @@ pub fn remove_ghost_sig(
                     new_rec.exprs.exprs.push_punct(Default::default());
                 }
                 new_rec
-            }), // Removed
+            }).filter(|_| mode.recommends), // Removed
             ensures: sig
                 .spec
                 .ensures
@@ -410,7 +428,9 @@ pub fn remove_verifier_attr(attr: &Vec<syn_verus::Attribute>) -> Vec<syn_verus::
 
 fn remove_ghost_fn(func: &syn_verus::ItemFn, mode: &DeghostMode) -> Option<syn_verus::ItemFn> {
     remove_ghost_sig(&func.sig, mode).and_then(|new_sig| {
-        if matches!(new_sig.mode, syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_)) {
+        if matches!(new_sig.mode, syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_))
+            || matches!(new_sig.mode, syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_))
+        {
             Some(func.clone())
         } else {
             remove_ghost_block(&(*func.block), mode).map(|new_block| {
@@ -446,6 +466,9 @@ fn remove_ghost_impl(i: &syn_verus::ItemImpl, mode: &DeghostMode) -> syn_verus::
                             if matches!(
                                 new_sig.mode,
                                 syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_)
+                            ) || matches!(
+                                new_sig.mode,
+                                syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_)
                             ) {
                                 Some(func.clone())
                             } else {
@@ -609,4 +632,655 @@ pub fn fextract_pure_rust(filepath: PathBuf, mode: &DeghostMode) -> Result<syn_v
 
         Ok(deghost_merge_files(&pure_file, verus_files))
     })
+}
+
+#[cfg(test)]
+mod deghost_tests {
+    use super::*;
+    use crate::utils::fprint_file;
+    use crate::Formatter;
+    use std::io::Write;
+
+    /// Write code to a temp file, deghost with the given mode, return the pretty-printed result.
+    fn deghost(code: &str, mode: &DeghostMode) -> String {
+        let mut tmp = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+        tmp.write_all(code.as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let result = fextract_pure_rust(tmp.path().to_path_buf(), mode).unwrap();
+        fprint_file(&result, Formatter::VerusFmt)
+    }
+
+    /// Check that `needle` appears in the deghosted output.
+    fn deghost_contains(code: &str, mode: &DeghostMode, needle: &str) -> bool {
+        deghost(code, mode).contains(needle)
+    }
+
+    // ── requires ────────────────────────────────────────────────────────
+
+    const FN_WITH_REQUIRES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+        requires x > 0,
+    { x }
+}
+"#;
+
+    #[test]
+    fn requires_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_REQUIRES, &DeghostMode::default(), "requires"));
+    }
+
+    #[test]
+    fn requires_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.requires = true;
+        assert!(deghost_contains(FN_WITH_REQUIRES, &mode, "requires"));
+    }
+
+    // ── ensures ─────────────────────────────────────────────────────────
+
+    const FN_WITH_ENSURES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+        ensures r == x,
+    { x }
+}
+"#;
+
+    #[test]
+    fn ensures_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_ENSURES, &DeghostMode::default(), "ensures"));
+    }
+
+    #[test]
+    fn ensures_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.ensures = true;
+        assert!(deghost_contains(FN_WITH_ENSURES, &mode, "ensures"));
+    }
+
+    // ── recommends ──────────────────────────────────────────────────────
+
+    const FN_WITH_RECOMMENDS: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+        recommends x > 0,
+    { x }
+}
+"#;
+
+    #[test]
+    fn recommends_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_RECOMMENDS, &DeghostMode::default(), "recommends"));
+    }
+
+    #[test]
+    fn recommends_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.recommends = true;
+        assert!(deghost_contains(FN_WITH_RECOMMENDS, &mode, "recommends"));
+    }
+
+    // ── decreases ───────────────────────────────────────────────────────
+
+    const FN_WITH_DECREASES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn countdown(n: u64) -> (r: u64)
+        decreases n,
+    {
+        if n == 0 { 0 } else { countdown(n - 1) }
+    }
+}
+"#;
+
+    #[test]
+    fn decreases_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_DECREASES, &DeghostMode::default(), "decreases"));
+    }
+
+    #[test]
+    fn decreases_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.decreases = true;
+        assert!(deghost_contains(FN_WITH_DECREASES, &mode, "decreases"));
+    }
+
+    // ── spec functions ──────────────────────────────────────────────────
+
+    const SPEC_FN: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn my_spec(x: nat) -> nat { x + 1 }
+    fn exec_fn() -> (r: u32) { 42 }
+}
+"#;
+
+    #[test]
+    fn spec_fn_stripped_by_default() {
+        assert!(!deghost_contains(SPEC_FN, &DeghostMode::default(), "my_spec"));
+    }
+
+    #[test]
+    fn spec_fn_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        assert!(deghost_contains(SPEC_FN, &mode, "my_spec"));
+    }
+
+    #[test]
+    fn exec_fn_always_retained() {
+        assert!(deghost_contains(SPEC_FN, &DeghostMode::default(), "exec_fn"));
+    }
+
+    // ── proof functions ─────────────────────────────────────────────────
+
+    const PROOF_FN: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    proof fn my_lemma()
+    {
+    }
+    fn exec_fn() -> (r: u32) { 42 }
+}
+"#;
+
+    #[test]
+    fn proof_fn_stripped_by_default() {
+        assert!(!deghost_contains(PROOF_FN, &DeghostMode::default(), "my_lemma"));
+    }
+
+    #[test]
+    fn proof_fn_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        assert!(deghost_contains(PROOF_FN, &mode, "my_lemma"));
+    }
+
+    // ── asserts ─────────────────────────────────────────────────────────
+
+    const FN_WITH_ASSERT: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+    {
+        assert(x == x);
+        x
+    }
+}
+"#;
+
+    #[test]
+    fn assert_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_ASSERT, &DeghostMode::default(), "assert("));
+    }
+
+    #[test]
+    fn assert_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.asserts = true;
+        assert!(deghost_contains(FN_WITH_ASSERT, &mode, "assert("));
+    }
+
+    // ── assert_forall ───────────────────────────────────────────────────
+
+    const FN_WITH_ASSERT_FORALL: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo()
+    {
+        assert forall |i: int| i >= 0 implies i >= 0 by {};
+        let x: u32 = 1;
+    }
+}
+"#;
+
+    #[test]
+    fn assert_forall_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_ASSERT_FORALL, &DeghostMode::default(), "assert forall"));
+    }
+
+    #[test]
+    fn assert_forall_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.assert_forall = true;
+        assert!(deghost_contains(FN_WITH_ASSERT_FORALL, &mode, "assert forall"));
+    }
+
+    // ── assumes ─────────────────────────────────────────────────────────
+
+    const FN_WITH_ASSUME: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+    {
+        assume(x > 0);
+        x
+    }
+}
+"#;
+
+    #[test]
+    fn assume_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_ASSUME, &DeghostMode::default(), "assume("));
+    }
+
+    #[test]
+    fn assume_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.assumes = true;
+        assert!(deghost_contains(FN_WITH_ASSUME, &mode, "assume("));
+    }
+
+    // ── proof_block ─────────────────────────────────────────────────────
+
+    const FN_WITH_PROOF_BLOCK: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+    {
+        proof {
+            assert(x == x);
+        }
+        x
+    }
+}
+"#;
+
+    #[test]
+    fn proof_block_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_PROOF_BLOCK, &DeghostMode::default(), "proof {"));
+    }
+
+    #[test]
+    fn proof_block_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.proof_block = true;
+        assert!(deghost_contains(FN_WITH_PROOF_BLOCK, &mode, "proof"));
+    }
+
+    // ── while loop invariants ───────────────────────────────────────────
+
+    const FN_WITH_WHILE_INVARIANTS: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(n: u64) -> (r: u64)
+    {
+        let mut i: u64 = 0;
+        let mut s: u64 = 0;
+        while i < n
+            invariant
+                i <= n,
+                s == i,
+            decreases n - i,
+        {
+            s = s + 1;
+            i = i + 1;
+        }
+        s
+    }
+}
+"#;
+
+    #[test]
+    fn while_invariant_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_WHILE_INVARIANTS, &DeghostMode::default(), "invariant"));
+    }
+
+    #[test]
+    fn while_invariant_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.invariants = true;
+        assert!(deghost_contains(FN_WITH_WHILE_INVARIANTS, &mode, "invariant"));
+    }
+
+    #[test]
+    fn while_decreases_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_WHILE_INVARIANTS, &DeghostMode::default(), "decreases"));
+    }
+
+    #[test]
+    fn while_decreases_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.decreases = true;
+        assert!(deghost_contains(FN_WITH_WHILE_INVARIANTS, &mode, "decreases"));
+    }
+
+    // ── empty requires/ensures (the push_punct fix) ─────────────────────
+
+    const FN_WITH_EMPTY_CLAUSES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(x: u32) -> (r: u32)
+        requires
+            // TODO
+        ensures
+            // TODO
+    { x }
+}
+"#;
+
+    #[test]
+    fn empty_clauses_no_panic() {
+        // This used to panic with "Punctuated::push_punct: cannot push punctuation..."
+        let _ = deghost(FN_WITH_EMPTY_CLAUSES, &DeghostMode::default());
+    }
+
+    #[test]
+    fn empty_clauses_with_requires_flag_no_panic() {
+        let mut mode = DeghostMode::default();
+        mode.requires = true;
+        mode.ensures = true;
+        let _ = deghost(FN_WITH_EMPTY_CLAUSES, &mode);
+    }
+
+    // ── flag isolation: enabling one flag doesn't leak others ────────────
+
+    const FN_WITH_ALL_GHOST: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn my_spec(x: nat) -> nat { x + 1 }
+    proof fn my_lemma()
+    {
+    }
+    fn foo(x: u32) -> (r: u32)
+        requires
+            x > 0,
+        ensures
+            r == x,
+    {
+        assert(x == x);
+        assume(x > 0);
+        x
+    }
+}
+"#;
+
+    #[test]
+    fn requires_flag_does_not_leak_ensures() {
+        let mut mode = DeghostMode::default();
+        mode.requires = true;
+        let out = deghost(FN_WITH_ALL_GHOST, &mode);
+        assert!(out.contains("requires"));
+        assert!(!out.contains("ensures"));
+    }
+
+    #[test]
+    fn ensures_flag_does_not_leak_requires() {
+        let mut mode = DeghostMode::default();
+        mode.ensures = true;
+        let out = deghost(FN_WITH_ALL_GHOST, &mode);
+        assert!(out.contains("ensures"));
+        assert!(!out.contains("requires"));
+    }
+
+    #[test]
+    fn asserts_flag_does_not_leak_assumes() {
+        let mut mode = DeghostMode::default();
+        mode.asserts = true;
+        let out = deghost(FN_WITH_ALL_GHOST, &mode);
+        assert!(out.contains("assert("));
+        assert!(!out.contains("assume("));
+    }
+
+    #[test]
+    fn assumes_flag_does_not_leak_asserts() {
+        let mut mode = DeghostMode::default();
+        mode.assumes = true;
+        let out = deghost(FN_WITH_ALL_GHOST, &mode);
+        assert!(out.contains("assume("));
+        assert!(!out.contains("assert("));
+    }
+
+    #[test]
+    fn spec_flag_does_not_leak_proof() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        let out = deghost(FN_WITH_ALL_GHOST, &mode);
+        assert!(out.contains("my_spec"));
+        assert!(!out.contains("my_lemma"));
+    }
+
+    #[test]
+    fn proof_flag_does_not_leak_spec() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        let out = deghost(FN_WITH_ALL_GHOST, &mode);
+        assert!(out.contains("my_lemma"));
+        assert!(!out.contains("my_spec"));
+    }
+
+    #[test]
+    fn recommends_flag_does_not_leak_requires() {
+        let mut mode = DeghostMode::default();
+        mode.recommends = true;
+        let out = deghost(FN_WITH_RECOMMENDS, &mode);
+        assert!(out.contains("recommends"));
+        assert!(!out.contains("requires"));
+    }
+
+    // ── default mode strips everything ──────────────────────────────────
+
+    #[test]
+    fn default_mode_strips_all_ghost() {
+        let out = deghost(FN_WITH_ALL_GHOST, &DeghostMode::default());
+        assert!(!out.contains("requires"));
+        assert!(!out.contains("ensures"));
+        assert!(!out.contains("assert("));
+        assert!(!out.contains("assume("));
+        assert!(!out.contains("my_spec"));
+        assert!(!out.contains("my_lemma"));
+        assert!(out.contains("foo")); // exec fn body preserved
+    }
+
+    // ── spec_checked_fn ─────────────────────────────────────────────────
+
+    const SPEC_CHECKED_FN: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec(checked) fn my_spec_checked(x: nat) -> nat { x + 1 }
+    fn exec_fn() -> (r: u32) { 42 }
+}
+"#;
+
+    #[test]
+    fn spec_checked_fn_stripped_by_default() {
+        assert!(!deghost_contains(SPEC_CHECKED_FN, &DeghostMode::default(), "my_spec_checked"));
+    }
+
+    #[test]
+    fn spec_checked_fn_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        assert!(deghost_contains(SPEC_CHECKED_FN, &mode, "my_spec_checked"));
+    }
+
+    // ── proof_axiom_fn ──────────────────────────────────────────────────
+
+    const PROOF_AXIOM_FN: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    #[verifier::external_body]
+    proof fn my_axiom()
+        ensures true,
+    {
+    }
+    fn exec_fn() -> (r: u32) { 42 }
+}
+"#;
+
+    #[test]
+    fn proof_axiom_fn_stripped_by_default() {
+        assert!(!deghost_contains(PROOF_AXIOM_FN, &DeghostMode::default(), "my_axiom"));
+    }
+
+    #[test]
+    fn proof_axiom_fn_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        assert!(deghost_contains(PROOF_AXIOM_FN, &mode, "my_axiom"));
+    }
+
+    // ── exec fn (explicit mode) ─────────────────────────────────────────
+
+    const EXEC_FN_EXPLICIT: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    exec fn my_exec(x: u32) -> (r: u32) { x }
+}
+"#;
+
+    #[test]
+    fn explicit_exec_fn_always_retained() {
+    }
+
+    // ── while invariant_ensures ─────────────────────────────────────────
+
+    const FN_WITH_WHILE_INVARIANT_ENSURES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(n: u64) -> (r: u64)
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant_ensures
+                i <= n,
+        {
+            i = i + 1;
+        }
+        i
+    }
+}
+"#;
+
+    #[test]
+    fn while_invariant_ensures_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_WHILE_INVARIANT_ENSURES, &DeghostMode::default(), "invariant_ensures"));
+    }
+
+    #[test]
+    fn while_invariant_ensures_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.invariants = true;
+        assert!(deghost_contains(FN_WITH_WHILE_INVARIANT_ENSURES, &mode, "invariant_ensures"));
+    }
+
+    // ── while invariant_except_break ────────────────────────────────────
+
+    const FN_WITH_WHILE_INVARIANT_EXCEPT_BREAK: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(n: u64) -> (r: u64)
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant_except_break
+                i < n,
+        {
+            i = i + 1;
+        }
+        i
+    }
+}
+"#;
+
+    #[test]
+    fn while_invariant_except_break_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_WHILE_INVARIANT_EXCEPT_BREAK, &DeghostMode::default(), "invariant_except_break"));
+    }
+
+    #[test]
+    fn while_invariant_except_break_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.invariants = true;
+        assert!(deghost_contains(FN_WITH_WHILE_INVARIANT_EXCEPT_BREAK, &mode, "invariant_except_break"));
+    }
+
+    // ── while loop ensures (separate from sig-level ensures) ────────────
+
+    const FN_WITH_WHILE_ENSURES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(n: u64) -> (r: u64)
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant
+                i <= n,
+            ensures
+                i == n,
+        {
+            i = i + 1;
+        }
+        i
+    }
+}
+"#;
+
+    #[test]
+    fn while_ensures_stripped_by_default() {
+        let out = deghost(FN_WITH_WHILE_ENSURES, &DeghostMode::default());
+        assert!(!out.contains("ensures"));
+    }
+
+    #[test]
+    fn while_ensures_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.ensures = true;
+        let out = deghost(FN_WITH_WHILE_ENSURES, &mode);
+        assert!(out.contains("ensures"));
+    }
+
+    // ── for-loop invariants/decreases ───────────────────────────────────
+
+    const FN_WITH_FOR_INVARIANT: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn foo(v: Vec<u64>)
+    {
+        let mut s: u64 = 0;
+        for i in iter: 0..v.len()
+            invariant
+                s <= i * 1000,
+        {
+            s = s + 1;
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn for_invariant_stripped_by_default() {
+        assert!(!deghost_contains(FN_WITH_FOR_INVARIANT, &DeghostMode::default(), "invariant"));
+    }
+
+    #[test]
+    fn for_invariant_retained_with_flag() {
+        let mut mode = DeghostMode::default();
+        mode.invariants = true;
+        assert!(deghost_contains(FN_WITH_FOR_INVARIANT, &mode, "invariant"));
+    }
 }
