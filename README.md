@@ -349,7 +349,9 @@ The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, 
 
 ## `lynette compare` — Compare Two Verus Files
 
-Compares whether two Verus source files produce the same Rust code after stripping ghost code. Various flags control which ghost code should also be compared.
+Compares whether two Verus source files produce the same Rust code after stripping ghost code ("deghosting"). By default, **all** ghost code (requires, ensures, asserts, invariants, spec functions, decreases, assumes) is stripped before comparison — so only the exec-level Rust code is compared. Each `--<kind>` flag **preserves** that kind of ghost code during comparison.
+
+Exits with code **0** if files are equivalent, or code **1** (printing `Files are different`) if they differ.
 
 ```bash
 lynette compare [OPTIONS] <FILE1> <FILE2>
@@ -359,7 +361,7 @@ lynette compare [OPTIONS] <FILE1> <FILE2>
 
 | Flag | Description |
 |---|---|
-| `-t, --target` | (Deprecated) Stricter comparison on qualifiers and spec functions |
+| `-t, --target` | (Deprecated) Enables `--requires --ensures --assumes --decreases` together |
 | `--requires` | Also compare `requires` clauses |
 | `--ensures` | Also compare `ensures` clauses |
 | `--invariants` | Also compare loop invariants |
@@ -368,23 +370,30 @@ lynette compare [OPTIONS] <FILE1> <FILE2>
 | `--asserts-anno` | Also compare asserts with annotations (e.g. `#[warn(llm_do_not_change)]`) |
 | `--decreases` | Also compare decreases clauses |
 | `--assumes` | Also compare assume statements |
-| `-v, --verbose` | Print both files after deghosting |
+| `-v, --verbose` | Print both files after deghosting to stdout |
 
 ### Example
 
 ```bash
-# Compare ignoring all ghost code
+# Compare ignoring all ghost code (only exec-level Rust code)
 lynette compare file1.rs file2.rs
 
-# Compare including requires and ensures
+# Compare including requires and ensures (but still ignoring asserts, invariants, etc.)
 lynette compare --requires --ensures file1.rs file2.rs
+
+# Compare everything including all ghost code
+lynette compare --requires --ensures --invariants --spec --asserts --decreases --assumes file1.rs file2.rs
 ```
 
 ---
 
 ## `lynette parse` — Parse & Validate Syntax
 
-Parses a Verus source file and optionally prints the token stream. Useful for syntax validation.
+Parses a Verus source file using `syn_verus` and optionally prints the debug representation of the token stream. Useful for syntax validation and inspecting how Verus code is tokenized.
+
+Exits with code **0** on successful parse, or code **1** with an error message if the file has syntax errors.
+
+Without `-c`, prints the debug-formatted token stream for both the outer file and each `verus!{...}` macro body (showing `Ident`, `Punct`, `Literal` tokens with byte spans).
 
 ```bash
 lynette parse [OPTIONS] <FILE>
@@ -397,10 +406,10 @@ lynette parse [OPTIONS] <FILE>
 ### Example
 
 ```bash
-# Validate syntax
+# Validate syntax (silent on success)
 lynette parse -c file.rs
 
-# Print token stream
+# Print debug token stream
 lynette parse file.rs
 ```
 
@@ -449,10 +458,16 @@ lynette func add [OPTIONS] <FILE> <FILE2>
 
 ### `func get-args` — Get Function Arguments
 
-Returns the arguments of a function as JSON.
+Returns the arguments of a function as a JSON array. Each entry has `"arg"` (parameter name/pattern) and `"ty"` (type).
 
 ```bash
 lynette func get-args <FILE> <FUNCTION>
+```
+
+#### Output Format
+
+```json
+[{"arg": "base", "ty": "nat"}, {"arg": "exp", "ty": "nat"}]
 ```
 
 ### `func remove` — Remove a Function
@@ -465,7 +480,9 @@ lynette func remove <FILE> <FUNCTION>
 
 ### `func detect-nl` — Detect Non-Linear Operations in a Function
 
-> **Status:** Unimplemented — this command will panic at runtime.
+> **Status:** Unimplemented — this command will panic at runtime. Use `code detect-nl` instead for file-level detection.
+
+Intended to detect non-linear arithmetic/bit operations within a specific function's assert expressions.
 
 ```bash
 lynette func detect-nl <FILE> <FUNCTION>
@@ -518,7 +535,7 @@ assert_forall:((4376, 16), (4389, 17))
 
 ### `code get-calls` — Extract Function Calls
 
-Returns all function/method calls in the file as JSON.
+Returns all function/method calls in the file as a JSON array. Each entry contains the function name, its arguments (as strings), and the source line number.
 
 ```bash
 lynette code get-calls [OPTIONS] <FILE>
@@ -528,14 +545,27 @@ lynette code get-calls [OPTIONS] <FILE>
 |---|---|
 | `-l, --line <RANGES>` | Only return calls at specific lines (e.g. `1-3,5,7-9`) |
 
+#### Output Format
+
+```json
+[{"func": "pow", "args": ["base", "(exp - 1) as nat"], "line": 24}]
+```
+
 ### `code get-func` — Get Function at Location
 
-Returns the function at a specific line or byte offset.
+Returns the name of the function whose span contains the given line or byte offset. Outputs a JSON-like bracketed list (e.g. `[func_name]`), or `[]` if no function is found at that location.
+
+Exactly one of `-l` or `-o` must be provided.
 
 ```bash
 lynette code get-func <FILE> -l <LINE>
 lynette code get-func <FILE> -o <OFFSET>
 ```
+
+| Flag | Description |
+|---|---|
+| `-l` | The 1-based line number to look up |
+| `-o` | The byte offset from the beginning of the file |
 
 ### `code detect-nl` — Detect Non-Linear Operations
 
@@ -655,7 +685,9 @@ lynette code remove-ghost [OPTIONS] <FILE>
 
 ## `lynette additions` — Check Allowed Additions
 
-Checks that only allowed code additions were made between two file versions. Exits with code 0 if only allowed additions are detected, or code 1 (printing "Disallowed changes detected") if disallowed changes are found.
+A safety checker for Verus proof-synthesis workflows. Verifies that the changes between an original file and a changed file conform to a strict set of rules — ensuring that an LLM or tool has not altered executable code it shouldn't have touched.
+
+Exits with code **0** if all changes are allowed, or code **1** (printing diagnostics) if disallowed changes are found.
 
 ```bash
 lynette additions <FILE1> <FILE2>
@@ -664,11 +696,42 @@ lynette additions <FILE1> <FILE2>
 - `<FILE1>` — the original file
 - `<FILE2>` — the changed file
 
+### What Counts as "Allowed"
+
+The checker walks both files' items in order and applies these rules:
+
+#### Target Functions
+
+A "target" function is a `proof` or `exec` function whose body does **not** contain `unimplemented!()` (i.e. the function the LLM is supposed to complete). For target functions:
+
+- **Proof target:** The body may be freely changed (new proof code), but the function's **visibility**, **non-proof attributes**, and **signature** (requires, ensures, recommends) must remain identical.
+- **Exec target:** After stripping all ghost code from both versions, the exec body must be **identical** (no changes to executable logic). The signature (requires, ensures, recommends) must also match. Ghost additions (asserts, invariants, proof blocks, lemma calls) inside the body **are** allowed.
+- Signature fields `decreases`, `opens_invariants`, and `prover` are excluded from the signature check — these may be freely added/changed.
+
+#### Non-Target Functions
+
+- **Existing `spec`, `proof`, or `exec` functions** that are not targets must be **exactly identical** in both files. Any modification is disallowed.
+- **New `spec` or `proof` functions** (present in `<FILE2>` but not in `<FILE1>`) are **allowed** — helper lemmas and specs may be added.
+- **New `exec` functions** are **disallowed**.
+
+#### Other Items
+
+| Item Type | Rule |
+|---|---|
+| `use` statements | May be added freely |
+| `macro_rules!` | May be added freely |
+| `broadcast use` | May be added freely |
+| `impl` blocks | The impl header must match exactly; methods inside follow the target/non-target rules above |
+| `trait` blocks | The trait header must match exactly; methods inside follow the target/non-target rules above |
+| `struct`, `enum`, `const`, etc. | Must be exactly identical |
+| Proof attributes (`verifier::rlimit`, `verifier::integer_ring`, `verifier::memoize`, `verifier::loop_isolation`, `verifier::spinoff_prover`) | Ignored during comparison — may be freely added or removed |
+| Number of `verus!{...}` macros | Must be the same in both files |
+
 ---
 
 ## `lynette benchmark` — Benchmark Preparation
 
-Prepares a Verus file for benchmarking by cleaning up helper code (stripping helper lemmas, reordering, etc.) and writes the result to an output file.
+Prepares a Verus file for benchmarking by performing a sequence of transformations and writing the result to an output file. The output is formatted with `prettyplease` and then `verusfmt`.
 
 ```bash
 lynette benchmark [OPTIONS] <FILE1> <FILE2>
@@ -679,7 +742,14 @@ lynette benchmark [OPTIONS] <FILE1> <FILE2>
 
 | Flag | Description |
 |---|---|
-| `-n, --no-lemma-mode` | Erase all lemmas |
+| `-n, --no-lemma-mode` | Also erase all helper lemmas (non-target proof functions) |
+
+### Transformations Applied
+
+1. **Reorder**: Moves target functions (the functions to be completed) to the end of the file, so they appear after all their dependencies.
+2. **Erase ghost from target**: Strips ghost code (asserts, invariants, proof blocks) from the bodies of target functions, producing a clean starting point for benchmarking.
+3. **Clean uses**: Cleans up `use` statements.
+4. **Remove helper lemmas** (only with `-n`): Removes all non-target `proof` functions (helper lemmas), leaving only spec functions and the target.
 
 ---
 
