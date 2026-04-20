@@ -12,21 +12,30 @@ cargo build --release
 # Binary at: ./target/release/lynette
 ```
 
-## Commands Overview
+## Command Index
 
-```
-lynette <COMMAND>
-
-Commands:
-  list        List all Verus segments with types, names, and locations
-  deps        Compute function dependencies (which spec_fns each function references)
-  compare     Compare two Verus files (ignoring ghost code by default)
-  parse       Parse and validate Verus syntax
-  func        Operations on individual functions
-  code        Operations on code-level constructs (ghost code, calls, etc.)
-  additions   Check that only allowed additions were made between two files
-  benchmark   Prepare a file for benchmarking (strip helper lemmas, etc.)
-```
+| Command | Description |
+|---|---|
+| [`list`](#lynette-list--list-all-verus-segments) | List all Verus segments with types, names, and locations |
+| [`deps`](#lynette-deps--compute-function-dependencies) | Compute function dependencies (which spec_fns each function references) |
+| [`compare`](#lynette-compare--compare-two-verus-files) | Compare two Verus files (ignoring ghost code by default) |
+| [`parse`](#lynette-parse--parse--validate-syntax) | Parse and validate Verus syntax |
+| [`func extract`](#func-extract--extract-a-function) | Print the full source of a function by name |
+| [`func add`](#func-add--add-functions-from-another-file) | Add functions from one file into another |
+| [`func get-args`](#func-get-args--get-function-arguments) | Return function arguments as JSON |
+| [`func remove`](#func-remove--remove-a-function) | Remove a function by name and print the resulting file |
+| [`func detect-nl`](#func-detect-nl--detect-non-linear-operations-in-a-function) | Detect non-linear operations in a function (**unimplemented**) |
+| [`func prune-quali`](#func-prune-quali--prune-prepost-conditions) | Remove requires and/or ensures from a function |
+| [`code get-ghost`](#code-get-ghost--extract-ghost-code-locations) | Extract ghost code locations (requires, ensures, asserts, invariants) |
+| [`code get-calls`](#code-get-calls--extract-function-calls) | Extract function/method calls as JSON |
+| [`code get-func`](#code-get-func--get-function-at-location) | Return the function name at a specific line or byte offset |
+| [`code detect-nl`](#code-detect-nl--detect-non-linear-operations) | Detect all non-linear arithmetic/bit operations in the file |
+| [`code merge`](#code-merge--merge-proof-code) | Merge proof code from two files (**currently disabled**) |
+| [`code unimpl`](#code-unimpl--mark-exec-functions-as-unimplemented) | Replace exec function bodies with `unimplemented!()`, one at a time |
+| [`code get-target`](#code-get-target--get-target-functions) | List functions tagged as target (**WIP**) |
+| [`code remove-ghost`](#code-remove-ghost--remove-ghost-code-at-spans) | Remove ghost code at given spans (**unimplemented**) |
+| [`additions`](#lynette-additions--check-allowed-additions) | Check that only allowed code additions were made between two file versions |
+| [`benchmark`](#lynette-benchmark--benchmark-preparation) | Prepare a Verus file for benchmarking (strip helper lemmas, reorder, etc.) |
 
 ---
 
@@ -456,6 +465,8 @@ lynette func remove <FILE> <FUNCTION>
 
 ### `func detect-nl` — Detect Non-Linear Operations in a Function
 
+> **Status:** Unimplemented — this command will panic at runtime.
+
 ```bash
 lynette func detect-nl <FILE> <FUNCTION>
 ```
@@ -485,10 +496,15 @@ Operations on code constructs across the entire file.
 Returns all ghost code (requires, ensures, assert, invariant, etc.) with source locations.
 
 ```bash
-lynette code get-ghost <FILE>
+lynette code get-ghost [OPTIONS] <FILE>
 ```
 
-Output format:
+| Flag | Description |
+|---|---|
+| `-b, --byte` | Print byte offsets instead of line/column numbers (**unimplemented**) |
+| `-l, --loc` | Print line/column numbers instead of byte offsets (default) |
+
+Output format (default `--loc`):
 ```
 type:((start_line, start_col), (end_line, end_col))
 ```
@@ -523,7 +539,7 @@ lynette code get-func <FILE> -o <OFFSET>
 
 ### `code detect-nl` — Detect Non-Linear Operations
 
-Detects all non-linear arithmetic/bit operations in the file.
+Detects all non-linear arithmetic/bit operations in the file. Returns a list of `(start, end)` positions.
 
 ```bash
 lynette code detect-nl [OPTIONS] <FILE>
@@ -531,9 +547,11 @@ lynette code detect-nl [OPTIONS] <FILE>
 
 | Flag | Description |
 |---|---|
-| `-s, --sig` | Also detect in function signatures |
+| `-c, --check` | Only check syntax, do not print anything |
 
 ### `code merge` — Merge Proof Code
+
+> **Status:** Currently disabled — this command exits with code 1 without producing output. The merge module is commented out in the source.
 
 Merges proof code from two files that share the same exec code.
 
@@ -546,9 +564,17 @@ lynette code merge [OPTIONS] <FILE1> <FILE2>
 | `--invariants` | Merge invariants (currently the only supported mode) |
 | `--all` | Merge everything |
 
-### `code unimpl` — Mark Functions as Unimplemented
+### `code unimpl` — Mark Exec Functions as Unimplemented
 
-Replaces function bodies with `unimplemented!()`.
+For each **exec** function in a Verus file, produces a version of the entire file where **that function's body** is kept intact and **all other exec functions** have their bodies replaced with `unimplemented!()` and annotated with `#[verifier::external_body]`.
+
+The following functions are **skipped** (never unimplemented):
+- `spec`, `proof`, and other ghost functions
+- Functions already having `#[verifier::external_body]` or `#[verifier::external_fn_specification]`
+- Functions whose body is already `unimplemented!()`
+- Functions tagged as "target" (unless `-t` is passed)
+
+Functions inside `trait` definitions and `impl` blocks are also processed.
 
 ```bash
 lynette code unimpl [OPTIONS] <FILE>
@@ -557,6 +583,68 @@ lynette code unimpl [OPTIONS] <FILE>
 | Flag | Description |
 |---|---|
 | `-t, --target` | Also unimplement target-tagged functions |
+
+#### Output Format
+
+Outputs a **JSON array** to stdout. Each entry represents one exec function that was eligible:
+
+```json
+[
+  {
+    "name": "function_name",
+    "code": "...full file with this function's body kept, all others replaced..."
+  }
+]
+```
+
+The `"name"` field uses qualified names for methods (e.g. `Type::method`). Each `"code"` entry is the full file source with exactly **one** exec function's body preserved and all others replaced with `unimplemented!()`.
+
+If no exec functions are found (e.g. the file only contains spec/proof functions), the output is `[]`.
+
+#### Example
+
+```bash
+# On a file with two exec functions (binary_search, sum_vec) and a proof function:
+lynette code unimpl file.rs
+# Returns JSON array with 2 entries:
+#   [0]: binary_search body kept, sum_vec body → unimplemented!()
+#   [1]: sum_vec body kept, binary_search body → unimplemented!()
+# The proof function is untouched in both entries.
+
+# Also unimplement target-tagged functions:
+lynette code unimpl -t file.rs
+```
+
+### `code get-target` — Get Target Functions
+
+> **Status:** WIP.
+
+Lists all functions tagged as "target" in a Verus source file.
+
+```bash
+lynette code get-target <FILE>
+```
+
+Outputs a bracketed, comma-separated list of function names:
+```
+[func1,func2]
+```
+
+Returns `[]` if no target-tagged functions are found.
+
+### `code remove-ghost` — Remove Ghost Code at Spans
+
+> **Status:** Unimplemented — this command will panic at runtime.
+
+Removes ghost code at given starting spans in a Verus source file.
+
+```bash
+lynette code remove-ghost [OPTIONS] <FILE>
+```
+
+| Flag | Description |
+|---|---|
+| `-l, --locs <LOCS>` | Comma-separated list of spans in `line:col` format to remove |
 
 ### `code get-ghost` vs `list`
 
@@ -567,21 +655,27 @@ lynette code unimpl [OPTIONS] <FILE>
 
 ## `lynette additions` — Check Allowed Additions
 
-Checks that only allowed code additions were made between two file versions.
+Checks that only allowed code additions were made between two file versions. Exits with code 0 if only allowed additions are detected, or code 1 (printing "Disallowed changes detected") if disallowed changes are found.
 
 ```bash
 lynette additions <FILE1> <FILE2>
 ```
 
+- `<FILE1>` — the original file
+- `<FILE2>` — the changed file
+
 ---
 
 ## `lynette benchmark` — Benchmark Preparation
 
-Prepares a Verus file for benchmarking by cleaning up helper code.
+Prepares a Verus file for benchmarking by cleaning up helper code (stripping helper lemmas, reordering, etc.) and writes the result to an output file.
 
 ```bash
 lynette benchmark [OPTIONS] <FILE1> <FILE2>
 ```
+
+- `<FILE1>` — input Verus source file
+- `<FILE2>` — output file path
 
 | Flag | Description |
 |---|---|
