@@ -361,7 +361,7 @@ lynette compare [OPTIONS] <FILE1> <FILE2>
 
 | Flag | Description |
 |---|---|
-| `-t, --target` | (Deprecated) Enables `--requires --ensures --assumes --decreases` together |
+| `-t, --target` | Enables `--requires --ensures --assumes --decreases` together |
 | `--requires` | Also compare `requires` clauses |
 | `--ensures` | Also compare `ensures` clauses |
 | `--invariants` | Also compare loop invariants |
