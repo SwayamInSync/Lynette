@@ -27,6 +27,7 @@ pub fn is_proof_or_exec(sig: &syn_verus::Signature) -> bool {
 pub enum Error {
     //IncorrectUsage,
     ReadFile(io::Error),
+    LexFile { error: proc_macro2::LexError, filepath: PathBuf },
     ParseFile { error: syn_verus::Error, filepath: PathBuf, source_code: String },
     NotFound(String),
     Conflict(String),
@@ -40,6 +41,7 @@ impl Display for Error {
         match self {
             //IncorrectUsage => write!(f, "Usage: dump-syntax path/to/filename.rs"),
             ReadFile(error) => write!(f, "Unable to read file: {}", error),
+            LexFile { error, filepath } => write!(f, "Unable to tokenize file {}: {}", filepath.display(), error),
             ParseFile { error, filepath, source_code } => {
                 render_location(f, error, filepath, source_code)
             }
@@ -115,7 +117,10 @@ fn render_fallback(formatter: &mut fmt::Formatter, err: &syn_verus::Error) -> fm
 
 pub fn fload_file(filepath: &PathBuf) -> Result<syn_verus::File, Error> {
     let code = fs::read_to_string(&filepath).map_err(Error::ReadFile)?;
-    let ts = proc_macro2::TokenStream::from_str(&code).unwrap();
+    let ts = proc_macro2::TokenStream::from_str(&code).map_err(|e| Error::LexFile {
+        error: e,
+        filepath: filepath.clone(),
+    })?;
 
     syn_verus::parse2::<syn_verus::File>(ts).map_err(|e| Error::ParseFile {
         error: e,
