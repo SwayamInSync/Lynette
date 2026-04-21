@@ -361,7 +361,7 @@ lynette compare [OPTIONS] <FILE1> <FILE2>
 
 | Flag | Description |
 |---|---|
-| `-t, --target` | *(Deprecated)* SEnables `--requires --ensures --assumes --decreases` together |
+| `-t, --target` | *(Deprecated)* Enables `--requires --ensures --assumes --decreases` together |
 | `--spec-mode` | Enable all spec-related flags (`--spec --requires --ensures --recommends --decreases`) |
 | `--proof-mode` | Enable all proof-related flags (`--proof --invariants --asserts --assert-forall --assumes --proof-block`) |
 | `--requires` | Also compare `requires` clauses |
