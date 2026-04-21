@@ -431,7 +431,13 @@ fn remove_ghost_fn(func: &syn_verus::ItemFn, mode: &DeghostMode) -> Option<syn_v
         if matches!(new_sig.mode, syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_))
             || matches!(new_sig.mode, syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_))
         {
-            Some(func.clone())
+            Some(syn_verus::ItemFn {
+                attrs: remove_verifier_attr(&func.attrs),
+                vis: func.vis.clone(),
+                sig: new_sig,
+                block: func.block.clone(),
+                semi_token: func.semi_token.clone(),
+            })
         } else {
             remove_ghost_block(&(*func.block), mode).map(|new_block| {
                 syn_verus::ItemFn {
@@ -470,7 +476,14 @@ fn remove_ghost_impl(i: &syn_verus::ItemImpl, mode: &DeghostMode) -> syn_verus::
                                 new_sig.mode,
                                 syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_)
                             ) {
-                                Some(func.clone())
+                                Some(syn_verus::ImplItemFn {
+                                    attrs: func.attrs.clone(),
+                                    vis: func.vis.clone(),
+                                    defaultness: func.defaultness.clone(),
+                                    sig: new_sig,
+                                    block: func.block.clone(),
+                                    semi_token: func.semi_token.clone(),
+                                })
                             } else {
                                 remove_ghost_block(&func.block, mode).map(|new_block| {
                                     syn_verus::ImplItemFn {
@@ -1282,5 +1295,512 @@ verus! {
         let mut mode = DeghostMode::default();
         mode.invariants = true;
         assert!(deghost_contains(FN_WITH_FOR_INVARIANT, &mode, "invariant"));
+    }
+
+    // ── clause stripping on proof/spec functions (regression tests) ─────
+    //
+    // When a proof or spec function is *retained* (mode.proof/mode.spec = true),
+    // clause-level flags (requires, ensures, recommends, decreases) must still
+    // control whether those clauses appear in the output.  Previously the code
+    // returned `func.clone()` for retained proof/spec fns, ignoring new_sig.
+
+    const PROOF_FN_WITH_REQUIRES_ENSURES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    proof fn my_lemma(x: nat)
+        requires
+            x > 0,
+        ensures
+            x >= 1,
+    {
+    }
+}
+"#;
+
+    #[test]
+    fn proof_fn_retained_strips_requires_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        // requires flag is off → requires clause should be stripped
+        let out = deghost(PROOF_FN_WITH_REQUIRES_ENSURES, &mode);
+        assert!(out.contains("my_lemma"), "proof fn should be retained");
+        assert!(!out.contains("requires"), "requires should be stripped when flag is off");
+    }
+
+    #[test]
+    fn proof_fn_retained_strips_ensures_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        // ensures flag is off → ensures clause should be stripped
+        let out = deghost(PROOF_FN_WITH_REQUIRES_ENSURES, &mode);
+        assert!(out.contains("my_lemma"), "proof fn should be retained");
+        assert!(!out.contains("ensures"), "ensures should be stripped when flag is off");
+    }
+
+    #[test]
+    fn proof_fn_retained_keeps_requires_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.requires = true;
+        let out = deghost(PROOF_FN_WITH_REQUIRES_ENSURES, &mode);
+        assert!(out.contains("my_lemma"));
+        assert!(out.contains("requires"));
+        assert!(out.contains("x > 0"));
+    }
+
+    #[test]
+    fn proof_fn_retained_keeps_ensures_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.ensures = true;
+        let out = deghost(PROOF_FN_WITH_REQUIRES_ENSURES, &mode);
+        assert!(out.contains("my_lemma"));
+        assert!(out.contains("ensures"));
+        assert!(out.contains("x >= 1"));
+    }
+
+    #[test]
+    fn proof_fn_retained_requires_on_ensures_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.requires = true;
+        // ensures stays off
+        let out = deghost(PROOF_FN_WITH_REQUIRES_ENSURES, &mode);
+        assert!(out.contains("requires"));
+        assert!(!out.contains("ensures"), "ensures should be stripped");
+    }
+
+    #[test]
+    fn proof_fn_retained_ensures_on_requires_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.ensures = true;
+        // requires stays off
+        let out = deghost(PROOF_FN_WITH_REQUIRES_ENSURES, &mode);
+        assert!(!out.contains("requires"), "requires should be stripped");
+        assert!(out.contains("ensures"));
+    }
+
+    // ── spec fn with clauses ────────────────────────────────────────────
+
+    const SPEC_FN_WITH_RECOMMENDS_DECREASES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn my_spec_fn(x: nat) -> nat
+        recommends x > 0,
+        decreases x,
+    {
+        if x == 0 { 0 } else { my_spec_fn((x - 1) as nat) }
+    }
+}
+"#;
+
+    #[test]
+    fn spec_fn_retained_strips_recommends_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        let out = deghost(SPEC_FN_WITH_RECOMMENDS_DECREASES, &mode);
+        assert!(out.contains("my_spec_fn"));
+        assert!(!out.contains("recommends"), "recommends should be stripped when flag is off");
+    }
+
+    #[test]
+    fn spec_fn_retained_strips_decreases_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        let out = deghost(SPEC_FN_WITH_RECOMMENDS_DECREASES, &mode);
+        assert!(out.contains("my_spec_fn"));
+        assert!(!out.contains("decreases"), "decreases should be stripped when flag is off");
+    }
+
+    #[test]
+    fn spec_fn_retained_keeps_recommends_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.recommends = true;
+        let out = deghost(SPEC_FN_WITH_RECOMMENDS_DECREASES, &mode);
+        assert!(out.contains("recommends"));
+        assert!(out.contains("x > 0"));
+    }
+
+    #[test]
+    fn spec_fn_retained_keeps_decreases_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.decreases = true;
+        let out = deghost(SPEC_FN_WITH_RECOMMENDS_DECREASES, &mode);
+        assert!(out.contains("decreases"));
+    }
+
+    // ── spec_checked fn with requires/ensures ───────────────────────────
+
+    const SPEC_CHECKED_FN_WITH_CLAUSES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec(checked) fn my_spec_checked(x: nat) -> nat
+        recommends x > 0,
+    {
+        x + 1
+    }
+}
+"#;
+
+    #[test]
+    fn spec_checked_fn_retained_strips_recommends_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        let out = deghost(SPEC_CHECKED_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_spec_checked"));
+        assert!(!out.contains("recommends"));
+    }
+
+    #[test]
+    fn spec_checked_fn_retained_keeps_recommends_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.recommends = true;
+        let out = deghost(SPEC_CHECKED_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_spec_checked"));
+        assert!(out.contains("recommends"));
+    }
+
+    // ── proof_axiom fn with ensures ─────────────────────────────────────
+
+    const PROOF_AXIOM_FN_WITH_ENSURES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    #[verifier::external_body]
+    proof fn my_axiom_lemma(x: nat)
+        ensures
+            x >= 0,
+    {
+    }
+}
+"#;
+
+    #[test]
+    fn proof_axiom_fn_retained_strips_ensures_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        let out = deghost(PROOF_AXIOM_FN_WITH_ENSURES, &mode);
+        assert!(out.contains("my_axiom_lemma"));
+        assert!(!out.contains("ensures"), "ensures should be stripped on proof axiom fn");
+    }
+
+    #[test]
+    fn proof_axiom_fn_retained_keeps_ensures_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.ensures = true;
+        let out = deghost(PROOF_AXIOM_FN_WITH_ENSURES, &mode);
+        assert!(out.contains("my_axiom_lemma"));
+        assert!(out.contains("ensures"));
+    }
+
+    // ── impl method (proof fn) with clauses ─────────────────────────────
+
+    const IMPL_PROOF_FN_WITH_CLAUSES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    struct Foo { x: nat }
+    impl Foo {
+        proof fn my_impl_lemma(&self)
+            requires
+                self.x > 0,
+            ensures
+                self.x >= 1,
+        {
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn impl_proof_fn_retained_strips_requires_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        let out = deghost(IMPL_PROOF_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_impl_lemma"));
+        assert!(!out.contains("requires"), "requires should be stripped on impl proof fn");
+    }
+
+    #[test]
+    fn impl_proof_fn_retained_strips_ensures_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        let out = deghost(IMPL_PROOF_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_impl_lemma"));
+        assert!(!out.contains("ensures"), "ensures should be stripped on impl proof fn");
+    }
+
+    #[test]
+    fn impl_proof_fn_retained_keeps_requires_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.requires = true;
+        let out = deghost(IMPL_PROOF_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_impl_lemma"));
+        assert!(out.contains("requires"));
+        assert!(out.contains("self.x > 0"));
+    }
+
+    #[test]
+    fn impl_proof_fn_retained_keeps_ensures_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.ensures = true;
+        let out = deghost(IMPL_PROOF_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_impl_lemma"));
+        assert!(out.contains("ensures"));
+    }
+
+    // ── impl method (spec fn) with clauses ──────────────────────────────
+
+    const IMPL_SPEC_FN_WITH_CLAUSES: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    struct Bar { val: nat }
+    impl Bar {
+        spec fn my_impl_spec(&self) -> nat
+            recommends self.val > 0,
+        {
+            self.val + 1
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn impl_spec_fn_retained_strips_recommends_when_flag_off() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        let out = deghost(IMPL_SPEC_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_impl_spec"));
+        assert!(!out.contains("recommends"), "recommends should be stripped on impl spec fn");
+    }
+
+    #[test]
+    fn impl_spec_fn_retained_keeps_recommends_when_flag_on() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.recommends = true;
+        let out = deghost(IMPL_SPEC_FN_WITH_CLAUSES, &mode);
+        assert!(out.contains("my_impl_spec"));
+        assert!(out.contains("recommends"));
+    }
+
+    // ── proof-mode composite flag ───────────────────────────────────────
+    // --proof-mode enables proof + invariants + asserts + assert_forall +
+    // assumes + proof_block, but NOT requires/ensures/recommends/decreases.
+
+    const PROOF_FN_IN_CONTEXT: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    proof fn lemma_a(x: nat)
+        requires
+            x > 0,
+        ensures
+            x >= 1,
+    {
+    }
+
+    fn exec_with_proof(n: u64) -> (r: u64)
+        requires
+            n > 0,
+        ensures
+            r == n,
+    {
+        proof {
+            assert(n > 0);
+        }
+        n
+    }
+}
+"#;
+
+    #[test]
+    fn proof_mode_strips_requires_on_proof_fn() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.invariants = true;
+        mode.asserts = true;
+        mode.assert_forall = true;
+        mode.assumes = true;
+        mode.proof_block = true;
+        // This is what --proof-mode sets. requires/ensures are NOT set.
+        let out = deghost(PROOF_FN_IN_CONTEXT, &mode);
+        assert!(out.contains("lemma_a"), "proof fn should be retained");
+        assert!(!out.contains("requires"), "requires should be stripped on both fns");
+        assert!(!out.contains("ensures"), "ensures should be stripped on both fns");
+        assert!(out.contains("proof"), "proof block should be retained");
+        assert!(out.contains("assert("), "assert should be retained");
+    }
+
+    #[test]
+    fn spec_mode_strips_proof_fn_entirely() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.requires = true;
+        mode.ensures = true;
+        mode.recommends = true;
+        mode.decreases = true;
+        // This is what --spec-mode sets. proof is NOT set.
+        let out = deghost(PROOF_FN_IN_CONTEXT, &mode);
+        assert!(!out.contains("lemma_a"), "proof fn should be stripped");
+        assert!(out.contains("exec_with_proof"), "exec fn should be retained");
+        assert!(out.contains("requires"), "requires on exec fn should be retained");
+        assert!(out.contains("ensures"), "ensures on exec fn should be retained");
+    }
+
+    // ── proof fn body is preserved when proof mode is on ────────────────
+
+    const PROOF_FN_WITH_BODY: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    proof fn lemma_with_body(x: nat, y: nat)
+        requires
+            x > 0,
+            y > 0,
+        ensures
+            x + y > 1,
+    {
+        assert(x >= 1);
+        assert(y >= 1);
+    }
+}
+"#;
+
+    #[test]
+    fn proof_fn_body_preserved_clauses_stripped() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        let out = deghost(PROOF_FN_WITH_BODY, &mode);
+        assert!(out.contains("lemma_with_body"));
+        // Body should be preserved as-is (not deghosted for proof fns)
+        assert!(out.contains("assert(x >= 1)") || out.contains("assert (x >= 1)"));
+        // But clauses should be stripped
+        assert!(!out.contains("requires"));
+        assert!(!out.contains("ensures"));
+    }
+
+    #[test]
+    fn proof_fn_body_and_clauses_preserved() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.requires = true;
+        mode.ensures = true;
+        let out = deghost(PROOF_FN_WITH_BODY, &mode);
+        assert!(out.contains("lemma_with_body"));
+        assert!(out.contains("requires"));
+        assert!(out.contains("ensures"));
+        assert!(out.contains("x > 0"));
+        assert!(out.contains("x + y > 1") || out.contains("x + y > 1"));
+    }
+
+    // ── mixed file: proof-mode should strip spec clauses everywhere ─────
+
+    const MIXED_FILE: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn helper(x: nat) -> bool { x > 0 }
+
+    proof fn my_proof(x: nat)
+        requires
+            helper(x),
+        ensures
+            x > 0,
+    {
+    }
+
+    fn my_exec(x: u32) -> (r: u32)
+        requires
+            x > 0,
+        ensures
+            r == x,
+    {
+        x
+    }
+}
+"#;
+
+    #[test]
+    fn mixed_file_proof_mode_only() {
+        let mut mode = DeghostMode::default();
+        mode.proof = true;
+        mode.invariants = true;
+        mode.asserts = true;
+        mode.assert_forall = true;
+        mode.assumes = true;
+        mode.proof_block = true;
+        let out = deghost(MIXED_FILE, &mode);
+        // spec fn stripped (mode.spec is off)
+        assert!(!out.contains("helper"), "spec fn should be stripped");
+        // proof fn retained
+        assert!(out.contains("my_proof"), "proof fn should be retained");
+        // exec fn retained
+        assert!(out.contains("my_exec"), "exec fn should be retained");
+        // ALL requires/ensures stripped (mode.requires/ensures are off)
+        assert!(!out.contains("requires"), "all requires should be stripped");
+        assert!(!out.contains("ensures"), "all ensures should be stripped");
+    }
+
+    #[test]
+    fn mixed_file_spec_mode_only() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.requires = true;
+        mode.ensures = true;
+        mode.recommends = true;
+        mode.decreases = true;
+        let out = deghost(MIXED_FILE, &mode);
+        // spec fn retained
+        assert!(out.contains("helper"), "spec fn should be retained");
+        // proof fn stripped
+        assert!(!out.contains("my_proof"), "proof fn should be stripped");
+        // exec fn retained with clauses
+        assert!(out.contains("my_exec"));
+        assert!(out.contains("requires"));
+        assert!(out.contains("ensures"));
+    }
+
+    #[test]
+    fn mixed_file_both_modes() {
+        let mut mode = DeghostMode::default();
+        mode.spec = true;
+        mode.proof = true;
+        mode.requires = true;
+        mode.ensures = true;
+        mode.recommends = true;
+        mode.decreases = true;
+        mode.invariants = true;
+        mode.asserts = true;
+        mode.assert_forall = true;
+        mode.assumes = true;
+        mode.proof_block = true;
+        let out = deghost(MIXED_FILE, &mode);
+        assert!(out.contains("helper"));
+        assert!(out.contains("my_proof"));
+        assert!(out.contains("my_exec"));
+        assert!(out.contains("requires"));
+        assert!(out.contains("ensures"));
+    }
+
+    #[test]
+    fn mixed_file_default_strips_everything() {
+        let out = deghost(MIXED_FILE, &DeghostMode::default());
+        assert!(!out.contains("helper"));
+        assert!(!out.contains("my_proof"));
+        assert!(out.contains("my_exec"));
+        assert!(!out.contains("requires"));
+        assert!(!out.contains("ensures"));
     }
 }
