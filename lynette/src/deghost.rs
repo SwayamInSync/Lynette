@@ -152,6 +152,29 @@ fn remove_ghost_expr(expr: &syn_verus::Expr, mode: &DeghostMode) -> Option<syn_v
                 })
             })
         }
+        syn_verus::Expr::Loop(l) => {
+            /*
+             * Fields to remove:
+             * - invariant_except_break
+             * - invariant
+             * - invariant_ensures
+             * - ensures
+             * - decreases
+             */
+            remove_ghost_block(&l.body, mode).map(|new_body| {
+                syn_verus::Expr::Loop(syn_verus::ExprLoop {
+                    attrs: l.attrs.clone(),
+                    label: l.label.clone(),
+                    loop_token: l.loop_token.clone(),
+                    body: new_body,
+                    invariant_except_break: if mode.invariants { l.invariant_except_break.clone() } else { None },
+                    invariant: if mode.invariants { l.invariant.clone() } else { None },
+                    invariant_ensures: if mode.invariants { l.invariant_ensures.clone() } else { None },
+                    ensures: if mode.ensures { l.ensures.clone() } else { None },
+                    decreases: if mode.decreases { l.decreases.clone() } else { None },
+                })
+            })
+        }
         syn_verus::Expr::Unary(u) => {
             match u.op {
                 /*
