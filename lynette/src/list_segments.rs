@@ -1,3 +1,4 @@
+use quote::ToTokens;
 use serde_json::json;
 use std::path::PathBuf;
 use syn::spanned::Spanned;
@@ -14,6 +15,10 @@ pub struct VerusSegment {
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    /// Rendered source text of the segment (when meaningful, e.g. a
+    /// requires/ensures clause expression). Empty for segments where the
+    /// span suffices (top-level items, blocks, etc.).
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +101,7 @@ fn collect_sig_ghosts(sig: &syn_verus::Signature, parent_name: &str, out: &mut V
             out.push(VerusSegment {
                 kind: SegmentKind::Requires,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
     }
@@ -106,7 +111,7 @@ fn collect_sig_ghosts(sig: &syn_verus::Signature, parent_name: &str, out: &mut V
             out.push(VerusSegment {
                 kind: SegmentKind::Ensures,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
     }
@@ -116,7 +121,7 @@ fn collect_sig_ghosts(sig: &syn_verus::Signature, parent_name: &str, out: &mut V
             out.push(VerusSegment {
                 kind: SegmentKind::Recommends,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
     }
@@ -126,7 +131,7 @@ fn collect_sig_ghosts(sig: &syn_verus::Signature, parent_name: &str, out: &mut V
             out.push(VerusSegment {
                 kind: SegmentKind::Decreases,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
     }
@@ -146,7 +151,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Assert,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
         syn_verus::Expr::AssertForall(a) => {
@@ -157,7 +162,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::AssertForall,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
         syn_verus::Expr::Assume(_a) => {
@@ -165,7 +170,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Assume,
                 name: parent_name.to_string(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
             });
         }
         syn_verus::Expr::Unary(u) => {
@@ -175,7 +180,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                 out.push(VerusSegment {
                     kind: SegmentKind::ProofBlock,
                     name: parent_name.to_string(),
-                    start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                    start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                 });
             } else {
                 collect_expr_ghosts(&u.expr, parent_name, out);
@@ -211,7 +216,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::Invariant,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -221,7 +226,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::InvariantEnsures,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -231,7 +236,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::InvariantExceptBreak,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -246,7 +251,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::Invariant,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -256,7 +261,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::Decreases,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -271,7 +276,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::Invariant,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -281,7 +286,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::InvariantEnsures,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -291,7 +296,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     out.push(VerusSegment {
                         kind: SegmentKind::InvariantExceptBreak,
                         name: parent_name.to_string(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
                 }
             }
@@ -337,7 +342,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             let (sl, sc, el, ec) = span_to_loc(f.span());
             out.push(VerusSegment {
                 kind, name: name.clone(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
             collect_sig_ghosts(&f.sig, &name, out);
             for stmt in &f.block.stmts {
@@ -354,7 +359,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Struct,
                 name,
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
         }
         syn_verus::Item::Enum(e) => {
@@ -367,7 +372,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Enum,
                 name,
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
         }
         syn_verus::Item::Type(t) => {
@@ -380,7 +385,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::TypeAlias,
                 name,
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
         }
         syn_verus::Item::Trait(t) => {
@@ -393,7 +398,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Trait,
                 name: trait_name.clone(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
             for ti in &t.items {
                 if let syn_verus::TraitItem::Fn(m) = ti {
@@ -402,7 +407,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
                     let (sl, sc, el, ec) = span_to_loc(m.span());
                     out.push(VerusSegment {
                         kind, name: fn_name.clone(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
                     });
                     collect_sig_ghosts(&m.sig, &fn_name, out);
                     if let Some(ref default_block) = m.default {
@@ -433,7 +438,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Impl,
                 name: full_impl_name.clone(),
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
@@ -442,7 +447,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
                     let (sl, sc, el, ec) = span_to_loc(m.span());
                     out.push(VerusSegment {
                         kind, name: fn_name.clone(),
-                        start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
                     });
                     collect_sig_ghosts(&m.sig, &fn_name, out);
                     for stmt in &m.block.stmts {
@@ -468,7 +473,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             out.push(VerusSegment {
                 kind: SegmentKind::Macro,
                 name,
-                start_line: sl, start_col: sc, end_line: el, end_col: ec,
+                start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
         }
         _ => {}
@@ -515,6 +520,7 @@ pub fn print_segments_json(segments: &[VerusSegment]) {
                 "start_col": seg.start_col,
                 "end_line": seg.end_line,
                 "end_col": seg.end_col,
+                "text": seg.text,
             })
         })
         .collect();
