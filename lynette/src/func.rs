@@ -67,65 +67,87 @@ pub fn fremove_function(filepath: &PathBuf, function: String) -> Result<syn_veru
 }
 
 pub fn extract_functions_by_name(file: &syn_verus::File, names: &[String]) -> Vec<FnMethod> {
-    file.items
-        .iter()
-        .flat_map(|item| match item {
-            syn_verus::Item::Fn(f) => {
-                if names.contains(&f.sig.ident.to_string()) {
-                    vec![FnMethod::Fn(f.clone())]
-                } else {
-                    vec![]
+    let mut out: Vec<FnMethod> = Vec::new();
+    for item in &file.items {
+        collect_fns_by_name(item, "", names, &mut out);
+    }
+    out
+}
+
+/// Walk an item tree, descending into ``mod`` blocks while building a
+/// fully-qualified namespace prefix so that callers can request functions
+/// nested inside modules with names like ``Outer::Inner::fn_name``.
+fn collect_fns_by_name(
+    item: &syn_verus::Item,
+    namespace: &str,
+    names: &[String],
+    out: &mut Vec<FnMethod>,
+) {
+    match item {
+        syn_verus::Item::Fn(f) => {
+            let qual = if namespace.is_empty() {
+                f.sig.ident.to_string()
+            } else {
+                format!("{}::{}", namespace, f.sig.ident)
+            };
+            // Match either fully-qualified or bare name to stay compatible
+            // with callers that haven't been updated to pass qualifiers.
+            if names.contains(&qual) || names.contains(&f.sig.ident.to_string()) {
+                out.push(FnMethod::Fn(f.clone()));
+            }
+        }
+        syn_verus::Item::Trait(t) => {
+            for i in &t.items {
+                if let syn_verus::TraitItem::Fn(m) = i {
+                    let trait_qual = if namespace.is_empty() {
+                        t.ident.to_string()
+                    } else {
+                        format!("{}::{}", namespace, t.ident)
+                    };
+                    let fn_qual = format!("{}::{}", trait_qual, m.sig.ident);
+                    if m.default.is_some() && names.contains(&fn_qual) {
+                        out.push(FnMethod::MethodDefault(
+                            syn_verus::ItemTrait { items: vec![], ..t.clone() },
+                            m.clone(),
+                        ));
+                    }
                 }
             }
-            syn_verus::Item::Trait(t) => t
-                .items
-                .iter()
-                .filter_map(|i| {
-                    if let syn_verus::TraitItem::Fn(m) = i {
-                        if m.default.is_some()
-                            && names.contains(&format!(
-                                "{}::{}",
-                                t.ident.to_string(),
-                                m.sig.ident.to_string()
-                            ))
-                        {
-                            Some(FnMethod::MethodDefault(
-                                syn_verus::ItemTrait { items: vec![], ..t.clone() },
-                                m.clone(),
-                            ))
-                        } else {
-                            None
-                        }
+        }
+        syn_verus::Item::Impl(ii) => {
+            for i in &ii.items {
+                if let syn_verus::ImplItem::Fn(m) = i {
+                    let owner = type_path_to_string(&ii.self_ty);
+                    let owner_qual = if namespace.is_empty() {
+                        owner.clone()
                     } else {
-                        None
+                        format!("{}::{}", namespace, owner)
+                    };
+                    let fn_qual = format!("{}::{}", owner_qual, m.sig.ident);
+                    let bare_qual = format!("{}::{}", owner, m.sig.ident);
+                    if names.contains(&fn_qual) || names.contains(&bare_qual) {
+                        out.push(FnMethod::Method(
+                            syn_verus::ItemImpl { items: vec![], ..ii.clone() },
+                            m.clone(),
+                        ));
                     }
-                })
-                .collect::<Vec<FnMethod>>(),
-            syn_verus::Item::Impl(ii) => ii
-                .items
-                .iter()
-                .filter_map(|i| {
-                    if let syn_verus::ImplItem::Fn(m) = i {
-                        if names.contains(dbg!(&format!(
-                            "{}::{}",
-                            type_path_to_string(&ii.self_ty),
-                            m.sig.ident.to_string()
-                        ))) {
-                            Some(FnMethod::Method(
-                                syn_verus::ItemImpl { items: vec![], ..ii.clone() },
-                                m.clone(),
-                            ))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<FnMethod>>(),
-            _ => vec![],
-        })
-        .collect::<Vec<FnMethod>>()
+                }
+            }
+        }
+        syn_verus::Item::Mod(m) => {
+            if let Some((_, items)) = &m.content {
+                let child_ns = if namespace.is_empty() {
+                    m.ident.to_string()
+                } else {
+                    format!("{}::{}", namespace, m.ident)
+                };
+                for it in items {
+                    collect_fns_by_name(it, &child_ns, names, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn fextract_function(filepath: &PathBuf, funcs: &[String]) -> Result<Vec<FnMethod>, Error> {

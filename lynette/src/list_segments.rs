@@ -476,6 +476,24 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
                 start_line: sl, start_col: sc, end_line: el, end_col: ec, text: String::new(),
             });
         }
+        syn_verus::Item::Mod(m) => {
+            // Descend into nested module bodies so segments inside them are
+            // surfaced with a fully-qualified name (e.g. ``M::N::fn_name``).
+            // Without this arm, anything wrapped in ``mod ... { ... }`` is
+            // silently dropped — and downstream tooling (the spec-equivalence
+            // harness generator) depends on ``list`` for clauses, so the
+            // resulting harness would have no equivalence checks for them.
+            if let Some((_, items)) = &m.content {
+                let child_ns = if namespace.is_empty() {
+                    m.ident.to_string()
+                } else {
+                    format!("{}::{}", namespace, m.ident)
+                };
+                for it in items {
+                    collect_item_segments(it, &child_ns, out);
+                }
+            }
+        }
         _ => {}
     }
 }
