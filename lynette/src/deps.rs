@@ -983,6 +983,12 @@ struct FnInfo {
     /// The impl/trait type this function belongs to (e.g. "Foo" for methods in `impl Foo`).
     /// `None` for free functions.
     impl_type: Option<String>,
+    /// The enclosing module path (e.g. "M1" for items inside `mod M1 { ... }`,
+    /// or "M1::M2" for nested mods). Empty string when the item lives at file
+    /// scope. Used to prefer same-mod candidates during bare-name resolution
+    /// so that `func` from inside `mod M1` resolves to `M1::func` and not to
+    /// a sibling `M3::func` that happens to share the bare name.
+    mod_path: String,
     /// All identifiers referenced by this function (signature specs + body).
     referenced_idents: HashSet<String>,
     /// Identifiers that appear specifically as call targets (`func(...)` position).
@@ -1020,7 +1026,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, local_macros: &Loca
 
             expand_local_macros(&f.block.stmts, &f.sig, local_macros, &mut idents, &mut call_targets);
 
-            out.push(FnInfo { name, kind, impl_type: None, referenced_idents: idents, call_target_idents: call_targets });
+            out.push(FnInfo { name, kind, impl_type: None, mod_path: namespace.to_string(), referenced_idents: idents, call_target_idents: call_targets });
         }
         syn_verus::Item::Impl(i) => {
             let impl_name = type_path_to_string(&i.self_ty);
@@ -1028,11 +1034,12 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, local_macros: &Loca
             if impl_name.is_empty() {
                 return;
             }
+            let qualified_owner = qualify_impl_owner(&impl_name, namespace);
             // Name impl methods as `Type::method` (matching list_segments),
             // regardless of whether this is a trait impl or inherent impl.
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
-                    let fn_name = format!("{}::{}", impl_name, m.sig.ident);
+                    let fn_name = format!("{}::{}", qualified_owner, m.sig.ident);
                     let kind = fn_mode_to_kind(&m.sig.mode);
 
                     let mut idents = HashSet::new();
@@ -1049,7 +1056,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, local_macros: &Loca
 
                     expand_local_macros(&m.block.stmts, &m.sig, local_macros, &mut idents, &mut call_targets);
 
-                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(impl_name.clone()), referenced_idents: idents, call_target_idents: call_targets });
+                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(qualified_owner.clone()), mod_path: namespace.to_string(), referenced_idents: idents, call_target_idents: call_targets });
                 }
             }
         }
@@ -1084,7 +1091,7 @@ fn collect_fn_infos(item: &syn_verus::Item, namespace: &str, local_macros: &Loca
                         .map(|b| b.stmts.as_slice()).unwrap_or(&[]);
                     expand_local_macros(default_stmts, &m.sig, local_macros, &mut idents, &mut call_targets);
 
-                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(trait_name.clone()), referenced_idents: idents, call_target_idents: call_targets });
+                    out.push(FnInfo { name: fn_name, kind, impl_type: Some(trait_name.clone()), mod_path: namespace.to_string(), referenced_idents: idents, call_target_idents: call_targets });
                 }
             }
         }
@@ -1178,12 +1185,34 @@ pub fn fcompute_deps(filepath: &PathBuf) -> Result<Vec<FnDependency>, Error> {
                 // `Foo::bar` over other `Type::bar` candidates. Only fall back to
                 // all candidates when none share the same impl type.
                 if let Some(qualified_list) = spec_by_bare.get(resolved_ident) {
+                    // Prefer same-impl candidates first; if none, prefer
+                    // same-mod candidates (a bare `func` inside `mod M1`
+                    // must resolve to `M1::func` not to a sibling
+                    // `M3::func` with the same bare name); only fall
+                    // back to all candidates when neither yields a
+                    // match.
                     let candidates: Vec<&String> = if let Some(ref impl_ty) = info.impl_type {
                         let prefix = format!("{}::", impl_ty);
                         let same_impl: Vec<&String> = qualified_list.iter()
                             .filter(|q| q.starts_with(&prefix))
                             .collect();
-                        if same_impl.is_empty() { qualified_list.iter().collect() } else { same_impl }
+                        if !same_impl.is_empty() {
+                            same_impl
+                        } else if !info.mod_path.is_empty() {
+                            let mp = format!("{}::", info.mod_path);
+                            let same_mod: Vec<&String> = qualified_list.iter()
+                                .filter(|q| q.starts_with(&mp))
+                                .collect();
+                            if same_mod.is_empty() { qualified_list.iter().collect() } else { same_mod }
+                        } else {
+                            qualified_list.iter().collect()
+                        }
+                    } else if !info.mod_path.is_empty() {
+                        let mp = format!("{}::", info.mod_path);
+                        let same_mod: Vec<&String> = qualified_list.iter()
+                            .filter(|q| q.starts_with(&mp))
+                            .collect();
+                        if same_mod.is_empty() { qualified_list.iter().collect() } else { same_mod }
                     } else {
                         qualified_list.iter().collect()
                     };
