@@ -16,6 +16,7 @@ mod deps;
 mod func;
 mod list_segments;
 //mod merge;
+mod skeleton;
 mod unimpl;
 mod utils;
 
@@ -27,6 +28,7 @@ use crate::deps::*;
 use crate::func::*;
 use crate::list_segments::*;
 //use crate::merge::*;
+use crate::skeleton::*;
 use crate::unimpl::*;
 use crate::utils::*;
 
@@ -467,6 +469,11 @@ struct ListArgs {
 }
 
 #[derive(Args)]
+struct SkeletonArgs {
+    file: PathBuf,
+}
+
+#[derive(Args)]
 struct DepsArgs {
     file: PathBuf,
     #[clap(
@@ -515,6 +522,17 @@ Example output:
   requires:entails_trans:((69, 8), (69, 20))
 "#)]
     List(ListArgs),
+    #[clap(about = r#"Generate a skeleton of a Verus source file.
+
+Replaces the bodies of leaf-level items (function blocks, struct/enum field
+lists, requires/ensures/decreases expressions, const/static initializers, ...)
+with `// TODO fill here` placeholders, while preserving the surrounding
+container items (mod, impl, trait, verus! macro).
+
+The result is intended to be fed to a model as a structural prompt that
+conditions it on where to write what.
+"#)]
+    Skeleton(SkeletonArgs),
     #[clap(about = r#"Compute dependencies between functions in a Verus file.
 
 For each function (proof_fn, spec_fn, etc.), reports which spec_fns defined in the
@@ -1038,6 +1056,13 @@ fn main() {
             } else {
                 print_segments_text(&segments);
             }
+        }
+        Commands::Skeleton(args) => {
+            let out = fskeleton_file(&args.file).unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                process::exit(1);
+            });
+            print!("{}", out);
         }
         Commands::Deps(args) => {
             let deps = fcompute_deps(&args.file).unwrap_or_else(|e| {
