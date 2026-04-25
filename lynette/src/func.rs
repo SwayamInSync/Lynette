@@ -118,11 +118,7 @@ fn collect_fns_by_name(
             for i in &ii.items {
                 if let syn_verus::ImplItem::Fn(m) = i {
                     let owner = type_path_to_string(&ii.self_ty);
-                    let owner_qual = if namespace.is_empty() {
-                        owner.clone()
-                    } else {
-                        format!("{}::{}", namespace, owner)
-                    };
+                    let owner_qual = qualify_impl_owner(&owner, namespace);
                     let fn_qual = format!("{}::{}", owner_qual, m.sig.ident);
                     let bare_qual = format!("{}::{}", owner, m.sig.ident);
                     if names.contains(&fn_qual) || names.contains(&bare_qual) {

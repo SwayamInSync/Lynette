@@ -420,6 +420,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
         }
         syn_verus::Item::Impl(i) => {
             let impl_name = type_path_to_string(&i.self_ty);
+            let qualified_owner = qualify_impl_owner(&impl_name, namespace);
             let impl_label = if let Some((_, ref trait_path, _)) = i.trait_ {
                 let trait_name = trait_path.segments.iter()
                     .map(|s| s.ident.to_string())
@@ -442,7 +443,7 @@ fn collect_item_segments(item: &syn_verus::Item, namespace: &str, out: &mut Vec<
             });
             for ii in &i.items {
                 if let syn_verus::ImplItem::Fn(m) = ii {
-                    let fn_name = format!("{}::{}", impl_name, m.sig.ident);
+                    let fn_name = format!("{}::{}", qualified_owner, m.sig.ident);
                     let kind = fn_mode_to_kind(&m.sig.mode);
                     let (sl, sc, el, ec) = span_to_loc(m.span());
                     out.push(VerusSegment {

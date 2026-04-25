@@ -526,3 +526,28 @@ pub fn type_path_to_string(t: &syn_verus::Type) -> String {
         String::new()
     }
 }
+
+/// Compute the fully qualified name of an impl-method, given the impl's
+/// ``self_ty`` (as a string from `type_path_to_string`) and the enclosing
+/// module ``namespace``. Rules:
+///
+/// * If ``self_ty`` is path-qualified (contains ``::``), use it as-is
+///   after stripping a leading ``crate::`` prefix (the analyzed file is
+///   the crate root). The impl block's namespace is ignored — the type's
+///   own path already encodes its module location.
+/// * Otherwise (bare type name), prepend the enclosing module namespace
+///   so two impl blocks of the same bare type in different modules are
+///   distinguishable (e.g. ``mod os::Constants`` vs ``mod os_ext::Constants``).
+pub fn qualify_impl_owner(self_ty_str: &str, namespace: &str) -> String {
+    if self_ty_str.is_empty() {
+        return self_ty_str.to_string();
+    }
+    if self_ty_str.contains("::") {
+        return self_ty_str.strip_prefix("crate::").unwrap_or(self_ty_str).to_string();
+    }
+    if namespace.is_empty() {
+        self_ty_str.to_string()
+    } else {
+        format!("{}::{}", namespace, self_ty_str)
+    }
+}
