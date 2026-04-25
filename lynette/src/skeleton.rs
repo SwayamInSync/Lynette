@@ -249,6 +249,115 @@ fn build_line_starts(source: &str) -> Vec<usize> {
     v
 }
 
+/// Erase every `//` line comment and `/* ... */` block comment in `source`,
+/// replacing each comment character with a single space while preserving
+/// newlines (and thus the line/column geometry that span offsets rely on).
+/// Respects string and char literals so that `"// not a comment"` is left
+/// untouched. Block comments may nest in Rust, so we track depth.
+///
+/// This is a leak-prevention measure: original comments often contain
+/// docstrings, hints, NL problem statements, or even fragments of the
+/// reference implementation that would otherwise leak into the skeleton
+/// emitted as a training prompt.
+fn blank_comments(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out: Vec<char> = chars.clone();
+    let n = chars.len();
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape = false;
+    while i < n {
+        let c = chars[i];
+        if escape {
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_char {
+            if c == '\\' {
+                escape = true;
+            } else if c == '\'' {
+                in_char = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        // Lifetimes (`'a`) look like an opening char literal but don't have a
+        // closing quote. Only enter char mode when we can see a closing `'`
+        // within a few chars (after an optional `\` escape).
+        if c == '\'' {
+            let mut j = i + 1;
+            if j < n && chars[j] == '\\' {
+                j += 2;
+            } else {
+                j += 1;
+            }
+            if j < n && chars[j] == '\'' {
+                in_char = true;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '/' && i + 1 < n {
+            let nx = chars[i + 1];
+            if nx == '/' {
+                // Line comment: blank to end of line (do not touch the \n).
+                let mut k = i;
+                while k < n && chars[k] != '\n' {
+                    out[k] = ' ';
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
+            if nx == '*' {
+                // Block comment with nesting; blank every char except '\n'.
+                let mut depth: usize = 1;
+                out[i] = ' ';
+                out[i + 1] = ' ';
+                let mut k = i + 2;
+                while k < n && depth > 0 {
+                    if k + 1 < n && chars[k] == '/' && chars[k + 1] == '*' {
+                        depth += 1;
+                        out[k] = ' ';
+                        out[k + 1] = ' ';
+                        k += 2;
+                    } else if k + 1 < n && chars[k] == '*' && chars[k + 1] == '/' {
+                        depth -= 1;
+                        out[k] = ' ';
+                        out[k + 1] = ' ';
+                        k += 2;
+                    } else {
+                        if chars[k] != '\n' {
+                            out[k] = ' ';
+                        }
+                        k += 1;
+                    }
+                }
+                i = k;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
 fn apply_replacements(source: &str, mut reps: Vec<Replacement>) -> String {
     if reps.is_empty() {
         return source.to_string();
@@ -301,7 +410,15 @@ pub fn fskeleton_file(filepath: &PathBuf) -> Result<String, Error> {
     for item in &file.items {
         collect_item(item, &mut reps);
     }
-    Ok(apply_replacements(&source, reps))
+    // Apply replacements against a comment-blanked copy of the source so the
+    // output never carries any of the original `//` or `/* */` comments
+    // (which can leak hints, NL problem statements, or reference-impl
+    // fragments into a training prompt). Spans are taken from the AST built
+    // from the *original* source; ``blank_comments`` preserves char-position
+    // geometry exactly, so the same (line, col) coordinates still resolve to
+    // the same byte offsets in the blanked text.
+    let blanked = blank_comments(&source);
+    Ok(strip_trailing_spaces(&apply_replacements(&blanked, reps)))
 }
 
 /// Build a skeleton view from an in-memory source string (used by callers that
@@ -321,5 +438,24 @@ pub fn skeleton_from_source(source: &str) -> Result<String, Error> {
     for item in &file.items {
         collect_item(item, &mut reps);
     }
-    Ok(apply_replacements(source, reps))
+    let blanked = blank_comments(source);
+    Ok(strip_trailing_spaces(&apply_replacements(&blanked, reps)))
+}
+
+/// Trim trailing spaces / tabs from every line. Comments that originally
+/// occupied an entire line become a line of spaces after ``blank_comments``;
+/// strip that residue so the output stays tidy.
+fn strip_trailing_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (idx, line) in s.split_inclusive('\n').enumerate() {
+        let _ = idx;
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let trimmed = body.trim_end_matches(|c: char| c == ' ' || c == '\t');
+        out.push_str(trimmed);
+        out.push_str(nl);
+    }
+    out
 }
