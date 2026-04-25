@@ -18,6 +18,7 @@ cargo build --release
 |---|---|
 | [`list`](#lynette-list--list-all-verus-segments) | List all Verus segments with types, names, and locations |
 | [`deps`](#lynette-deps--compute-function-dependencies) | Compute function dependencies (which spec_fns each function references) |
+| [`skeleton`](#lynette-skeleton--generate-a-leaf-blanked-skeleton) | Generate a structural skeleton with leaf bodies replaced by `// TODO fill here` |
 | [`compare`](#lynette-compare--compare-two-verus-files) | Compare two Verus files (ignoring ghost code by default) |
 | [`parse`](#lynette-parse--parse--validate-syntax) | Parse and validate Verus syntax |
 | [`func extract`](#func-extract--extract-a-function) | Print the full source of a function by name |
@@ -344,6 +345,164 @@ The **source** side includes functions of **all** kinds (`exec_fn`, `proof_fn`, 
 | **External macros opaque** | Only locally-defined `macro_rules!` are expanded; `use`-imported or proc-macros are not | Define wrapper macros locally if needed |
 | **`use` aliases not tracked** | `use Foo as Bar; Bar::method()` won't resolve to `Foo::method` | Use original names |
 | **`unsafe` blocks not traversed** | References inside `unsafe { ... }` blocks are missed | N/A |
+
+---
+
+## `lynette skeleton` — Generate a Leaf-Blanked Skeleton
+
+**Added command.** Produces a *structural skeleton* of a Verus source file by replacing the contents of every **leaf-level** item with a `// TODO fill here` placeholder, while keeping the surrounding container items (`mod`, `impl`, `trait`, the top-level `verus!{ ... }` macro) intact.
+
+This is intended for prompting a code-generation model with the file's structure — telling it *where* to write spec/proof/exec code without revealing the answer. The original whitespace, comments, and item ordering are preserved (the transformation is a span-based textual rewrite of the original source, not a re-rendering of the AST).
+
+```bash
+lynette skeleton <FILE>
+```
+
+The skeleton is printed to stdout. The exit code is **0** on success and **1** on parse failure (with the error printed to stderr).
+
+### What gets blanked
+
+Each *leaf* contribution is replaced independently; containers are recursed into without modification.
+
+| Item kind | Replacement |
+|---|---|
+| `fn` body (free, `impl` method, `trait` method default) | The whole `{ ... }` block becomes `{ <newline>    // TODO fill here <newline>}`. **Empty bodies (`{}`) are preserved as-is.** |
+| `requires` clause | The expression list is replaced by `// TODO fill here` (the trailing `,` is also consumed) |
+| `ensures` clause | Same as `requires` |
+| `recommends` clause | Same as `requires` |
+| `decreases` clause (signature-level) | Same as `requires` |
+| `struct` with named fields | The `{ ... }` field list becomes `{ // TODO fill here }`. **Unit and tuple structs (`struct Foo;`, `struct Foo(i32, i32);`) are left untouched.** |
+| `enum` with variants | The `{ ... }` variant list becomes `{ // TODO fill here }` |
+| `const` initializer (free or in `impl`) | The right-hand side becomes `/* TODO fill here */` (block comment so the trailing `;` is preserved) |
+| `static` initializer | Same as `const` |
+| `trait` method **without** a default body | Left untouched (no body is invented) |
+| `trait` const **without** a default value | Left untouched |
+| `mod`, `impl`, `trait`, top-level `verus!{ ... }` | **Containers** — header is kept, contents are recursed into |
+| Type aliases, `use` items, macros (other than `verus!`) | Left untouched |
+
+Indentation of every inserted block is computed from the column of the enclosing item, so the output is structurally faithful at every nesting level.
+
+### Example
+
+Input (`/tmp/example.rs`):
+
+```rust
+use vstd::prelude::*;
+
+verus! {
+
+struct Point { x: int, y: int }
+
+impl Point {
+    spec fn norm_sq(self) -> int {
+        self.x * self.x + self.y * self.y
+    }
+
+    proof fn lemma_nonneg(self)
+        requires
+            true,
+        ensures
+            self.norm_sq() >= 0,
+    {
+        assert(self.x * self.x >= 0) by (nonlinear_arith);
+    }
+}
+
+const MAX_VAL: u64 = 100 + 200;
+
+mod inner {
+    fn helper(x: u64) -> u64 { x + 1 }
+}
+
+fn main() {}
+
+}
+```
+
+Running `lynette skeleton /tmp/example.rs`:
+
+```rust
+use vstd::prelude::*;
+
+verus! {
+
+struct Point {
+    // TODO fill here
+}
+
+impl Point {
+    spec fn norm_sq(self) -> int {
+        // TODO fill here
+    }
+
+    proof fn lemma_nonneg(self)
+        requires
+            // TODO fill here
+        ensures
+            // TODO fill here
+    {
+        // TODO fill here
+    }
+}
+
+const MAX_VAL: u64 = /* TODO fill here */;
+
+mod inner {
+    fn helper(x: u64) -> u64 {
+        // TODO fill here
+    }
+}
+
+fn main() {}
+
+}
+```
+
+### How it works
+
+1. The file is parsed with `syn_verus`. Top-level `verus!{ ... }` macro contents are re-parsed as a Verus `File` so that items inside it are visited too.
+2. The AST is walked. For each leaf item, a `Replacement { start, end, text }` record is collected using the AST span (line/column) of the region to be blanked. Containers (`mod`, `impl`, `trait`, `verus!`) recurse without contributing their own replacement.
+3. Replacements are sorted in reverse source order and applied directly to the original file's bytes. This preserves all comments, blank lines, and formatting that lie outside the blanked regions — something a `ToTokens` round-trip cannot do.
+4. For `requires`/`ensures`/`recommends`/`decreases` clause lists, the trailing `,` after the last expression (which is part of the clause syntax but not part of the last expression's span) is also consumed so the result is well-formed.
+
+### Notes & limitations
+
+- `// TODO fill here` is a line comment; for inline contexts (after a `=` in a `const`/`static`) the block-comment form `/* TODO fill here */` is used so the trailing `;` survives.
+- Functions with empty bodies (`fn main() {}`, `fn empty_test() {}`) are intentionally **not** blanked — they carry no leaf content to hide.
+- Loop-internal spec clauses (`invariant`, `invariant_ensures`, `decreases` inside `while`/`for`/`loop`) are *not* blanked separately — they live inside a function body, which is blanked as a whole.
+- Asserts, assumes, and inline `proof { ... }` blocks are likewise covered by the enclosing function body's blanking.
+- If parsing fails, the file is left untouched and the command exits with a non-zero status.
+
+### Programmatic use
+
+The Rust API is exposed in `lynette::skeleton`:
+
+```rust
+use lynette::skeleton::{fskeleton_file, skeleton_from_source};
+
+let s = fskeleton_file(&"path/to/file.rs".into())?;
+let s = skeleton_from_source(verus_source_string)?;
+```
+
+### Python wrapper
+
+```python
+import os, subprocess, tempfile
+
+LYNETTE_BIN = "/path/to/lynette"
+
+def make_skeleton(code: str) -> str:
+    with tempfile.NamedTemporaryFile("w", suffix=".rs", delete=False) as f:
+        f.write(code); path = f.name
+    try:
+        r = subprocess.run([LYNETTE_BIN, "skeleton", path],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr)
+        return r.stdout
+    finally:
+        os.unlink(path)
+```
 
 ---
 
