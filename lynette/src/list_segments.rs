@@ -240,6 +240,16 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     });
                 }
             }
+            if let Some(ref d) = w.decreases {
+                for expr in &d.exprs.exprs {
+                    let (sl, sc, el, ec) = span_to_loc(expr.span());
+                    out.push(VerusSegment {
+                        kind: SegmentKind::Decreases,
+                        name: parent_name.to_string(),
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
+                    });
+                }
+            }
             for stmt in &w.body.stmts {
                 collect_stmt_ghosts(stmt, parent_name, out);
             }
@@ -295,6 +305,16 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                     let (sl, sc, el, ec) = span_to_loc(expr.span());
                     out.push(VerusSegment {
                         kind: SegmentKind::InvariantExceptBreak,
+                        name: parent_name.to_string(),
+                        start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
+                    });
+                }
+            }
+            if let Some(ref d) = l.decreases {
+                for expr in &d.exprs.exprs {
+                    let (sl, sc, el, ec) = span_to_loc(expr.span());
+                    out.push(VerusSegment {
+                        kind: SegmentKind::Decreases,
                         name: parent_name.to_string(),
                         start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
