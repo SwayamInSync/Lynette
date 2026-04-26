@@ -36,6 +36,7 @@ pub enum SegmentKind {
     Invariant,
     InvariantEnsures,
     InvariantExceptBreak,
+    LoopEnsures,
     Assert,
     AssertForall,
     Assume,
@@ -64,6 +65,7 @@ impl SegmentKind {
             SegmentKind::Invariant => "invariant",
             SegmentKind::InvariantEnsures => "invariant_ensures",
             SegmentKind::InvariantExceptBreak => "invariant_except_break",
+            SegmentKind::LoopEnsures => "loop_ensures",
             SegmentKind::Assert => "assert",
             SegmentKind::AssertForall => "assert_forall",
             SegmentKind::Assume => "assume",
@@ -254,7 +256,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                 for expr in &ens.exprs.exprs {
                     let (sl, sc, el, ec) = span_to_loc(expr.span());
                     out.push(VerusSegment {
-                        kind: SegmentKind::Ensures,
+                        kind: SegmentKind::LoopEnsures,
                         name: parent_name.to_string(),
                         start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
@@ -334,7 +336,7 @@ fn collect_expr_ghosts(expr: &syn_verus::Expr, parent_name: &str, out: &mut Vec<
                 for expr in &ens.exprs.exprs {
                     let (sl, sc, el, ec) = span_to_loc(expr.span());
                     out.push(VerusSegment {
-                        kind: SegmentKind::Ensures,
+                        kind: SegmentKind::LoopEnsures,
                         name: parent_name.to_string(),
                         start_line: sl, start_col: sc, end_line: el, end_col: ec, text: expr.to_token_stream().to_string(),
                     });
