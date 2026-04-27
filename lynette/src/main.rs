@@ -173,13 +173,13 @@ struct DetectNLArgs {
 #[derive(Clone)]
 #[derive(Args)]
 pub struct DeghostMode {
-    #[clap(long, help = "Compare requires")]
+    #[clap(long, help = "Compare requires (function signatures)")]
     requires: bool,
-    #[clap(long, help = "Compare ensures")]
+    #[clap(long, help = "Compare ensures on function signatures (loop ensures are gated by --invariants)")]
     ensures: bool,
     #[clap(long, help = "Compare recommends")]
     recommends: bool,
-    #[clap(long, help = "Compare invariants (sig-level and loop invariants)")]
+    #[clap(long, help = "Compare loop spec block: invariants, loop_ensures, and loop-level decreases (all proof-mode concerns)")]
     invariants: bool,
     #[clap(long, help = "Compare spec functions")]
     spec: bool,
@@ -191,7 +191,7 @@ pub struct DeghostMode {
     assert_forall: bool,
     #[clap(long, help = "Compare asserts with annotations(e.g. #[warn(llm_do_not_change)])")]
     asserts_anno: bool,
-    #[clap(long, help = "Compare decreases")]
+    #[clap(long, help = "Compare decreases on function signatures (loop decreases are gated by --invariants)")]
     decreases: bool,
     #[clap(long, help = "Compare assumes")]
     assumes: bool,
@@ -277,6 +277,19 @@ struct CompareArgs {
 
     #[clap(long, help = "Enable all proof-related flags (proof, invariants, asserts, assert-forall, assumes, proof-block)")]
     proof_mode: bool,
+
+    #[clap(
+        long,
+        help = "When used with --spec-mode, ignore *new* proof-fn helpers that <FILE2> \
+                introduces but that are not present in <FILE1>. The comparison is \
+                directional: <FILE1> is treated as the original/spec-defining file and \
+                <FILE2> as the candidate (e.g. a model-generated proof completion). \
+                Proof fns present in <FILE1> must still be present in <FILE2> with an \
+                identical signature (incl. requires/ensures/recommends/decreases) — \
+                renaming or deleting an existing proof fn is therefore detected as a \
+                difference. Has no effect outside --spec-mode."
+    )]
+    allow_helpers: bool,
 
     #[clap(flatten)]
     opts: DeghostMode,
@@ -570,7 +583,16 @@ fn compare_files(args: &CompareArgs) -> Result<bool, Error> {
         mode.requires = true;
         mode.ensures = true;
         mode.recommends = true;
-        mode.decreases = true;
+        // Note: do NOT set `mode.decreases = true` here. Signature-level
+        // `decreases` is termination scaffolding (two functions with
+        // identical bodies but different `decreases` are extensionally
+        // equivalent) and is unconditionally stripped under `--spec-mode`
+        // by `keep_sig_decreases` in deghost.rs — the masker blanks
+        // `decreases` per-mode (spec-mode on spec_fn sigs, proof-mode on
+        // proof_fn sigs, exec-mode on exec_fn sigs) and the verifier
+        // mirrors that by ignoring all signature `decreases`. Pass
+        // `--decreases` explicitly to keep them.  Loop-level `decreases`
+        // is gated by `mode.invariants` and stays off under spec-mode.
     }
 
     if args.proof_mode {
@@ -584,6 +606,11 @@ fn compare_files(args: &CompareArgs) -> Result<bool, Error> {
 
     fextract_pure_rust(f1, &mode).and_then(|result1| {
         fextract_pure_rust(f2, &mode).and_then(|result2| {
+            let (result1, result2) = if args.allow_helpers && args.spec_mode {
+                strip_proof_fn_helpers(result1, result2)
+            } else {
+                (result1, result2)
+            };
             if args.verbose {
                 println!("{}", fprint_file(&result1, Formatter::VerusFmt));
                 println!("{}", fprint_file(&result2, Formatter::VerusFmt));
@@ -591,6 +618,94 @@ fn compare_files(args: &CompareArgs) -> Result<bool, Error> {
             Ok(result1 == result2)
         })
     })
+}
+
+/// Collect proof-fn names defined at the top level or inside `impl` blocks of
+/// a (deghosted) file. Top-level proof fns are keyed by their identifier;
+/// `impl`-bound proof fns are keyed by `<self_ty>::<method>` so methods on
+/// different types don't collide.
+fn collect_proof_fn_names(file: &syn_verus::File) -> std::collections::HashSet<String> {
+    use syn_verus::FnMode;
+    fn is_proof(mode: &FnMode) -> bool {
+        matches!(mode, FnMode::Proof(_) | FnMode::ProofAxiom(_))
+    }
+    let mut names = std::collections::HashSet::new();
+    for item in &file.items {
+        match item {
+            syn_verus::Item::Fn(f) if is_proof(&f.sig.mode) => {
+                names.insert(f.sig.ident.to_string());
+            }
+            syn_verus::Item::Impl(i) => {
+                let self_ty = i.self_ty.to_token_stream().to_string();
+                for ii in &i.items {
+                    if let syn_verus::ImplItem::Fn(m) = ii {
+                        if is_proof(&m.sig.mode) {
+                            names.insert(format!("{}::{}", self_ty, m.sig.ident));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Drop from `file` any proof fn whose name does not appear in `keep`.
+fn drop_proof_fns_not_in(
+    file: syn_verus::File,
+    keep: &std::collections::HashSet<String>,
+) -> syn_verus::File {
+    use syn_verus::FnMode;
+    fn is_proof(mode: &FnMode) -> bool {
+        matches!(mode, FnMode::Proof(_) | FnMode::ProofAxiom(_))
+    }
+    let new_items = file
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            syn_verus::Item::Fn(ref f) if is_proof(&f.sig.mode) => {
+                if keep.contains(&f.sig.ident.to_string()) {
+                    Some(item)
+                } else {
+                    None
+                }
+            }
+            syn_verus::Item::Impl(mut i) => {
+                let self_ty = i.self_ty.to_token_stream().to_string();
+                i.items.retain(|ii| match ii {
+                    syn_verus::ImplItem::Fn(m) if is_proof(&m.sig.mode) => {
+                        keep.contains(&format!("{}::{}", self_ty, m.sig.ident))
+                    }
+                    _ => true,
+                });
+                Some(syn_verus::Item::Impl(i))
+            }
+            _ => Some(item),
+        })
+        .collect();
+    syn_verus::File {
+        shebang: file.shebang,
+        attrs: file.attrs,
+        items: new_items,
+    }
+}
+
+/// Asymmetric pass for `--allow-helpers`. Treats `f1` as the original file and
+/// `f2` as the candidate (model output). Drops from `f2` any proof fn whose
+/// name is not in `f1`; `f1` is left untouched. This means:
+///  * new proof helpers in `f2` are ignored (allowed),
+///  * removed/renamed proof fns from `f1` produce a diff (forbidden).
+///
+/// Proof fns present in both are kept on both sides so that `--spec-mode`
+/// continues to detect changes to their signature / requires / ensures /
+/// recommends / decreases.
+fn strip_proof_fn_helpers(
+    f1: syn_verus::File,
+    f2: syn_verus::File,
+) -> (syn_verus::File, syn_verus::File) {
+    let names1 = collect_proof_fn_names(&f1);
+    (f1, drop_proof_fns_not_in(f2, &names1))
 }
 
 // Borrowed and modified from syn/src/item.rs
@@ -1259,5 +1374,1118 @@ mod cli_tests {
     fn cli_deps_real_benchmark_no_panic() {
         let (_, _, code) = run_deps(&["-j"], "real_benchmark.rs");
         assert_eq!(code, 0, "real benchmark file should not panic");
+    }
+
+    // ── compare --spec-mode --allow-helpers ─────────────────────────────
+
+    fn write_tmp(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lynette_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    fn run_compare(extra_args: &[&str], a: &PathBuf, b: &PathBuf) -> i32 {
+        let mut args: Vec<&str> = vec!["compare"];
+        args.extend_from_slice(extra_args);
+        let a_s = a.to_str().unwrap();
+        let b_s = b.to_str().unwrap();
+        args.push(a_s);
+        args.push(b_s);
+        Command::new(lynette_bin())
+            .args(&args)
+            .output()
+            .expect("failed to execute lynette")
+            .status
+            .code()
+            .unwrap_or(-1)
+    }
+
+    const COMPARE_BASE: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn p(x: nat) -> bool { x > 10 }
+
+    proof fn equiv(x: nat)
+        ensures p(x) =~= p(x),
+    { }
+
+    fn use_p(x: u32) -> (r: u32)
+        requires p(x as nat),
+        ensures r == x,
+    { x }
+}
+"#;
+
+    /// Same file as COMPARE_BASE but with an *added* proof helper lemma.
+    const COMPARE_WITH_PROOF_HELPER: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn p(x: nat) -> bool { x > 10 }
+
+    proof fn equiv(x: nat)
+        ensures p(x) =~= p(x),
+    {
+        helper(x);
+    }
+
+    proof fn helper(x: nat)
+        ensures true,
+    { }
+
+    fn use_p(x: u32) -> (r: u32)
+        requires p(x as nat),
+        ensures r == x,
+    { x }
+}
+"#;
+
+    #[test]
+    fn cli_compare_spec_mode_flags_added_proof_helper_without_allow_helpers() {
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", COMPARE_WITH_PROOF_HELPER);
+        let code = run_compare(&["--spec-mode"], &a, &b);
+        assert_eq!(code, 1, "added proof helper should be flagged without --allow-helpers");
+    }
+
+    #[test]
+    fn cli_compare_spec_mode_allow_helpers_ignores_added_proof_helper() {
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", COMPARE_WITH_PROOF_HELPER);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 0, "added proof helper should be ignored under --allow-helpers");
+    }
+
+    #[test]
+    fn cli_compare_spec_mode_allow_helpers_asymmetric_helper_in_file1_is_flagged() {
+        // A proof fn present in FILE1 but absent in FILE2 is treated as a
+        // *removed* lemma (the model dropped/renamed an existing one).
+        // This MUST be flagged — the comparison is directional.
+        let a = write_tmp("a.rs", COMPARE_WITH_PROOF_HELPER);
+        let b = write_tmp("b.rs", COMPARE_BASE);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(
+            code, 1,
+            "removing a proof fn that existed in FILE1 must be flagged \
+             (--allow-helpers is directional: only NEW helpers in FILE2 are allowed)"
+        );
+    }
+
+    #[test]
+    fn cli_compare_allow_helpers_still_detects_exec_change() {
+        let modified = COMPARE_WITH_PROOF_HELPER.replace("r == x,", "r == x + 1,");
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", &modified);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 1, "exec ensures change must still be flagged");
+    }
+
+    #[test]
+    fn cli_compare_allow_helpers_still_detects_existing_proof_fn_ensures_change() {
+        // Weakening `equiv`'s ensures should still be flagged because `equiv`
+        // exists in both files (it's not a helper).
+        let modified = COMPARE_WITH_PROOF_HELPER
+            .replace("ensures p(x) =~= p(x),", "ensures true,");
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", &modified);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 1, "existing proof fn ensures change must still be flagged");
+    }
+
+    #[test]
+    fn cli_compare_allow_helpers_still_detects_added_spec_fn() {
+        // A new spec fn is not a "helper" — it changes the spec surface.
+        let with_extra_spec = COMPARE_BASE.replace(
+            "spec fn p(x: nat) -> bool { x > 10 }",
+            "spec fn p(x: nat) -> bool { x > 10 }\n    spec fn q(x: nat) -> bool { x > 0 }",
+        );
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", &with_extra_spec);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 1, "added spec fn must still be flagged under --allow-helpers");
+    }
+
+    #[test]
+    fn cli_compare_allow_helpers_still_detects_added_exec_fn() {
+        let with_extra_exec = COMPARE_BASE.replace(
+            "fn use_p(x: u32) -> (r: u32)",
+            "fn extra(x: u32) -> u32 { x }\n\n    fn use_p(x: u32) -> (r: u32)",
+        );
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", &with_extra_exec);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 1, "added exec fn must still be flagged under --allow-helpers");
+    }
+
+    #[test]
+    fn cli_compare_allow_helpers_no_effect_without_spec_mode() {
+        // Default compare ignores all ghost code, so adding a proof helper
+        // doesn't change the deghosted output anyway. This test just confirms
+        // --allow-helpers without --spec-mode doesn't error or change behavior.
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", COMPARE_WITH_PROOF_HELPER);
+        let code = run_compare(&["--allow-helpers"], &a, &b);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn cli_compare_allow_helpers_multiple_added_helpers() {
+        let multi = COMPARE_BASE.replace(
+            "proof fn equiv(x: nat)\n        ensures p(x) =~= p(x),\n    { }",
+            "proof fn equiv(x: nat)\n        ensures p(x) =~= p(x),\n    {\n        h1(x); h2(x);\n    }\n\n    proof fn h1(x: nat) ensures true, { }\n\n    proof fn h2(x: nat) ensures true, { }",
+        );
+        let a = write_tmp("a.rs", COMPARE_BASE);
+        let b = write_tmp("b.rs", &multi);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 0);
+    }
+
+    // Impl-method helpers
+    const COMPARE_IMPL_BASE: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    struct S { x: u32 }
+    impl S {
+        spec fn ok(&self) -> bool { self.x > 0 }
+        proof fn lemma_main(&self)
+            ensures self.x >= 0,
+        { }
+        fn get(&self) -> u32 { self.x }
+    }
+}
+"#;
+
+    const COMPARE_IMPL_WITH_HELPER: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    struct S { x: u32 }
+    impl S {
+        spec fn ok(&self) -> bool { self.x > 0 }
+        proof fn lemma_main(&self)
+            ensures self.x >= 0,
+        { self.lemma_helper(); }
+        proof fn lemma_helper(&self)
+            ensures true,
+        { }
+        fn get(&self) -> u32 { self.x }
+    }
+}
+"#;
+
+    #[test]
+    fn cli_compare_allow_helpers_impl_method_helper_ignored() {
+        let a = write_tmp("a.rs", COMPARE_IMPL_BASE);
+        let b = write_tmp("b.rs", COMPARE_IMPL_WITH_HELPER);
+        let without = run_compare(&["--spec-mode"], &a, &b);
+        let with = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(without, 1, "impl proof method helper should be flagged without --allow-helpers");
+        assert_eq!(with, 0, "impl proof method helper should be ignored under --allow-helpers");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Exhaustive cheat-vector suite for `--spec-mode --allow-helpers`.
+    //
+    // The proof-writing contract for the model is:
+    //   1. Cannot change spec function bodies or signatures
+    //   2. Cannot change requires/ensures of proof or exec functions
+    //   3. Cannot change signatures of proof or exec functions
+    //   4. CAN change proof-fn bodies, proof blocks, loop invariants, and
+    //      other proof-only code inside function bodies
+    //   5. CAN add new proof helper lemmas (top-level or impl methods)
+    //
+    // Every test below either confirms that a forbidden edit IS detected
+    // (`assert_flagged`) or that an allowed edit is NOT detected
+    // (`assert_equal`). FILE1 is the original; FILE2 is the candidate
+    // (model output).
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Run `compare --spec-mode --allow-helpers` on two snippet strings and
+    /// assert the candidate is rejected (exit code 1).
+    fn assert_flagged(input: &str, candidate: &str, msg: &str) {
+        let a = write_tmp("input.rs", input);
+        let b = write_tmp("candidate.rs", candidate);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 1, "MUST flag: {msg}");
+    }
+
+    /// Run `compare --spec-mode --allow-helpers` and assert the candidate is
+    /// accepted (exit code 0).
+    fn assert_equal(input: &str, candidate: &str, msg: &str) {
+        let a = write_tmp("input.rs", input);
+        let b = write_tmp("candidate.rs", candidate);
+        let code = run_compare(&["--spec-mode", "--allow-helpers"], &a, &b);
+        assert_eq!(code, 0, "MUST accept: {msg}");
+    }
+
+    fn vwrap(body: &str) -> String {
+        format!("use vstd::prelude::*;\nfn main() {{}}\nverus! {{\n{}\n}}\n", body)
+    }
+
+    // ── Rule 1: spec function body must not change ──────────────────────
+
+    #[test]
+    fn cheat_spec_fn_body_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 10 }");
+        let b = vwrap("spec fn p(x: nat) -> bool { x > 20 }");
+        assert_flagged(&a, &b, "spec fn body change");
+    }
+
+    #[test]
+    fn cheat_spec_fn_body_weakened_to_true() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 10 }");
+        let b = vwrap("spec fn p(x: nat) -> bool { true }");
+        assert_flagged(&a, &b, "weakening spec fn to `true` is the classic trivial-proof cheat");
+    }
+
+    #[test]
+    fn cheat_spec_fn_quantifier_flipped() {
+        let a = vwrap("spec fn all_gt(s: Seq<i32>, k: i32) -> bool { forall|i: int| 0 <= i < s.len() ==> s[i] > k }");
+        let b = vwrap("spec fn all_gt(s: Seq<i32>, k: i32) -> bool { exists|i: int| 0 <= i < s.len() && s[i] > k }");
+        assert_flagged(&a, &b, "forall→exists flip is a semantic cheat");
+    }
+
+    #[test]
+    fn cheat_spec_fn_branch_swapped() {
+        let a = vwrap("spec fn p(x: nat) -> bool { if x > 10 { true } else { false } }");
+        let b = vwrap("spec fn p(x: nat) -> bool { if x > 10 { false } else { true } }");
+        assert_flagged(&a, &b, "swapping if-branches in spec body");
+    }
+
+    // ── Rule 1: spec function signature must not change ─────────────────
+
+    #[test]
+    fn cheat_spec_fn_renamed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("spec fn q(x: nat) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "spec fn rename");
+    }
+
+    #[test]
+    fn cheat_spec_fn_param_type_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("spec fn p(x: int) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "spec fn param type change");
+    }
+
+    #[test]
+    fn cheat_spec_fn_param_name_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("spec fn p(y: nat) -> bool { y > 0 }");
+        assert_flagged(&a, &b, "spec fn param rename (changes alpha-equivalent body too)");
+    }
+
+    #[test]
+    fn cheat_spec_fn_return_type_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("spec fn p(x: nat) -> nat { x }");
+        assert_flagged(&a, &b, "spec fn return type change");
+    }
+
+    #[test]
+    fn cheat_spec_fn_arity_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("spec fn p(x: nat, y: nat) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "spec fn arity change");
+    }
+
+    #[test]
+    fn cheat_spec_fn_recommends_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool recommends x > 0, { x > 10 }");
+        let b = vwrap("spec fn p(x: nat) -> bool recommends true, { x > 10 }");
+        assert_flagged(&a, &b, "spec fn recommends change");
+    }
+
+    #[test]
+    fn cheat_spec_fn_kind_changed_to_spec_checked() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("spec(checked) fn p(x: nat) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "spec → spec(checked) is a contract change");
+    }
+
+    #[test]
+    fn cheat_spec_fn_visibility_changed() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("pub spec fn p(x: nat) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "visibility change on spec fn");
+    }
+
+    // ── Rule 1: spec functions cannot be added or removed ──────────────
+
+    #[test]
+    fn cheat_added_spec_fn() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap(
+            "spec fn p(x: nat) -> bool { x > 0 }\n    spec fn extra(x: nat) -> bool { true }",
+        );
+        assert_flagged(&a, &b, "model added a new spec fn (not allowed even as helper)");
+    }
+
+    #[test]
+    fn cheat_removed_spec_fn() {
+        let a = vwrap(
+            "spec fn p(x: nat) -> bool { x > 0 }\n    spec fn q(x: nat) -> bool { x > 1 }",
+        );
+        let b = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "model removed a spec fn");
+    }
+
+    // ── Rule 2: requires/ensures of proof functions must not change ────
+
+    #[test]
+    fn cheat_proof_fn_ensures_weakened_to_true() {
+        let a = vwrap("proof fn lem(x: nat) ensures x + 0 == x, { }");
+        let b = vwrap("proof fn lem(x: nat) ensures true, { }");
+        assert_flagged(&a, &b, "weakening proof fn ensures to `true` (the original bug)");
+    }
+
+    #[test]
+    fn cheat_proof_fn_ensures_removed() {
+        let a = vwrap("proof fn lem(x: nat) ensures x + 0 == x, { }");
+        let b = vwrap("proof fn lem(x: nat) { }");
+        assert_flagged(&a, &b, "proof fn ensures removed");
+    }
+
+    #[test]
+    fn cheat_proof_fn_ensures_replaced() {
+        let a = vwrap("proof fn lem(x: nat) ensures x + 0 == x, { }");
+        let b = vwrap("proof fn lem(x: nat) ensures x >= 0, { }");
+        assert_flagged(&a, &b, "proof fn ensures replaced with a different (easier) goal");
+    }
+
+    #[test]
+    fn cheat_proof_fn_requires_strengthened() {
+        // Stronger requires = trivially provable but cheaper for callers.
+        let a = vwrap("proof fn lem(x: nat) requires x > 0, ensures x > 0, { }");
+        let b = vwrap("proof fn lem(x: nat) requires false, ensures x > 0, { }");
+        assert_flagged(&a, &b, "proof fn requires strengthened to `false`");
+    }
+
+    #[test]
+    fn cheat_proof_fn_requires_weakened() {
+        let a = vwrap("proof fn lem(x: nat) requires x > 0, ensures x > 0, { }");
+        let b = vwrap("proof fn lem(x: nat) requires true, ensures x > 0, { }");
+        assert_flagged(&a, &b, "proof fn requires weakened");
+    }
+
+    #[test]
+    fn allowed_proof_fn_decreases_changed() {
+        // Under the context-aware decreases rule, `decreases` on a proof_fn
+        // signature is treated as proof-mode content (a termination measure
+        // for a recursive lemma). The masking pipeline blanks it under
+        // proof-mode masks; for `compare --spec-mode --allow-helpers` to
+        // accept the model's completion we therefore must NOT flag changes
+        // to proof_fn decreases. See `keep_sig_decreases` in deghost.rs.
+        let a = vwrap("proof fn lem(x: nat) ensures true, decreases x, { }");
+        let b = vwrap("proof fn lem(x: nat) ensures true, decreases 0nat, { }");
+        assert_equal(&a, &b, "proof fn decreases change is allowed under --spec-mode");
+    }
+
+    #[test]
+    fn allowed_proof_fn_decreases_removed() {
+        // Same as above: model can drop the proof_fn decreases entirely.
+        let a = vwrap("proof fn lem(x: nat) ensures true, decreases x, { }");
+        let b = vwrap("proof fn lem(x: nat) ensures true, { }");
+        assert_equal(&a, &b, "proof fn decreases removal is allowed under --spec-mode");
+    }
+
+    #[test]
+    fn allowed_spec_fn_decreases_changed() {
+        // Unified rule: signature `decreases` is termination scaffolding
+        // and is ignored by `compare --spec-mode --allow-helpers` for
+        // every fn kind. Tests for spec_fn here.
+        let a = vwrap("spec fn p(x: nat) -> nat decreases x, { if x == 0 { 0 } else { p((x - 1) as nat) } }");
+        let b = vwrap("spec fn p(x: nat) -> nat decreases 0nat, { if x == 0 { 0 } else { p((x - 1) as nat) } }");
+        assert_equal(&a, &b, "spec fn decreases change is allowed under --spec-mode");
+    }
+
+    #[test]
+    fn allowed_exec_fn_decreases_removed() {
+        // Same rule for exec_fn signature decreases.
+        let a = vwrap("fn foo(n: u64) -> (r: u64) decreases n, { if n == 0 { 0 } else { foo(n - 1) } }");
+        let b = vwrap("fn foo(n: u64) -> (r: u64) { if n == 0 { 0 } else { foo(n - 1) } }");
+        assert_equal(&a, &b, "exec fn decreases removal is allowed under --spec-mode");
+    }
+
+    // ── Rule 2: requires/ensures of exec functions must not change ─────
+
+    #[test]
+    fn cheat_exec_fn_requires_weakened() {
+        let a = vwrap("fn foo(x: u32) -> u32 requires x > 5, { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 requires x > 0, { x }");
+        assert_flagged(&a, &b, "exec fn requires weakened");
+    }
+
+    #[test]
+    fn cheat_exec_fn_requires_removed() {
+        let a = vwrap("fn foo(x: u32) -> u32 requires x > 5, { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { x }");
+        assert_flagged(&a, &b, "exec fn requires removed");
+    }
+
+    #[test]
+    fn cheat_exec_fn_ensures_weakened_to_true() {
+        let a = vwrap("fn foo(x: u32) -> (r: u32) ensures r == x, { x }");
+        let b = vwrap("fn foo(x: u32) -> (r: u32) ensures true, { x }");
+        assert_flagged(&a, &b, "exec fn ensures weakened to true");
+    }
+
+    #[test]
+    fn cheat_exec_fn_ensures_removed() {
+        let a = vwrap("fn foo(x: u32) -> (r: u32) ensures r == x, { x }");
+        let b = vwrap("fn foo(x: u32) -> (r: u32) { x }");
+        assert_flagged(&a, &b, "exec fn ensures removed");
+    }
+
+    #[test]
+    fn allowed_exec_fn_decreases_changed() {
+        let a = vwrap("fn foo(n: u32) -> u32 decreases n, { if n == 0 { 0 } else { foo(n - 1) } }");
+        let b = vwrap("fn foo(n: u32) -> u32 decreases 0u32, { if n == 0 { 0 } else { foo(n - 1) } }");
+        assert_equal(&a, &b, "exec fn decreases change is allowed under --spec-mode");
+    }
+
+    // ── Rule 3: function signatures must not change ────────────────────
+
+    #[test]
+    fn cheat_exec_fn_renamed() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn bar(x: u32) -> u32 { x }");
+        assert_flagged(&a, &b, "exec fn rename");
+    }
+
+    #[test]
+    fn cheat_exec_fn_body_changed() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { x + 1 }");
+        assert_flagged(&a, &b, "exec fn body change");
+    }
+
+    #[test]
+    fn cheat_exec_fn_param_type_changed() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u64) -> u32 { x as u32 }");
+        assert_flagged(&a, &b, "exec fn param type change");
+    }
+
+    #[test]
+    fn cheat_exec_fn_return_type_changed() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u64 { x as u64 }");
+        assert_flagged(&a, &b, "exec fn return type change");
+    }
+
+    #[test]
+    fn cheat_exec_fn_named_return_pattern_changed() {
+        let a = vwrap("fn foo(x: u32) -> (r: u32) ensures r == x, { x }");
+        let b = vwrap("fn foo(x: u32) -> (s: u32) ensures s == x, { x }");
+        assert_flagged(&a, &b, "renaming the named return binder changes the contract surface");
+    }
+
+    #[test]
+    fn cheat_exec_fn_generics_changed() {
+        let a = vwrap("fn foo<T>(x: T) -> T { x }");
+        let b = vwrap("fn foo<T: Copy>(x: T) -> T { x }");
+        assert_flagged(&a, &b, "exec fn generic bound change");
+    }
+
+    #[test]
+    fn cheat_exec_fn_visibility_changed() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("pub fn foo(x: u32) -> u32 { x }");
+        assert_flagged(&a, &b, "exec fn visibility change");
+    }
+
+    #[test]
+    fn cheat_exec_fn_unsafety_changed() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("unsafe fn foo(x: u32) -> u32 { x }");
+        assert_flagged(&a, &b, "adding `unsafe`");
+    }
+
+    #[test]
+    fn cheat_proof_fn_renamed() {
+        // KEY CHEAT VECTOR: under symmetric helper-stripping, renaming a
+        // proof fn would silently pass. The asymmetric design must catch it.
+        let a = vwrap("proof fn lemma_a(x: nat) ensures x >= 0, { }");
+        let b = vwrap("proof fn lemma_b(x: nat) ensures x >= 0, { }");
+        assert_flagged(
+            &a,
+            &b,
+            "renaming an existing proof fn (asymmetric helper rule must catch this)",
+        );
+    }
+
+    #[test]
+    fn cheat_proof_fn_param_type_changed() {
+        let a = vwrap("proof fn lem(x: nat) ensures true, { }");
+        let b = vwrap("proof fn lem(x: int) ensures true, { }");
+        assert_flagged(&a, &b, "proof fn param type change");
+    }
+
+    #[test]
+    fn cheat_proof_fn_return_type_changed() {
+        let a = vwrap("proof fn lem(x: nat) -> nat ensures true, { x }");
+        let b = vwrap("proof fn lem(x: nat) -> int ensures true, { x as int }");
+        assert_flagged(&a, &b, "proof fn return type change");
+    }
+
+    #[test]
+    fn cheat_proof_fn_arity_changed() {
+        let a = vwrap("proof fn lem(x: nat) ensures x >= 0, { }");
+        let b = vwrap("proof fn lem(x: nat, y: nat) ensures x >= 0, { }");
+        assert_flagged(&a, &b, "proof fn arity change");
+    }
+
+    // ── Rule 3 corollary: cannot delete an existing proof fn ───────────
+
+    #[test]
+    fn cheat_existing_proof_fn_deleted() {
+        let a = vwrap(
+            "proof fn keep(x: nat) ensures true, { }\n\
+             proof fn delete_me(x: nat) ensures x >= 0, { }",
+        );
+        let b = vwrap("proof fn keep(x: nat) ensures true, { }");
+        assert_flagged(&a, &b, "model deleted an existing proof fn");
+    }
+
+    // ── Rule 3: cannot add new exec functions ──────────────────────────
+
+    #[test]
+    fn cheat_added_exec_fn() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { x }\n    fn bar(x: u32) -> u32 { x }");
+        assert_flagged(&a, &b, "model added a new exec fn");
+    }
+
+    #[test]
+    fn cheat_removed_exec_fn() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }\n    fn bar(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { x }");
+        assert_flagged(&a, &b, "model removed an exec fn");
+    }
+
+    // ── Rule 3: cannot convert between function kinds ──────────────────
+
+    #[test]
+    fn cheat_spec_fn_converted_to_proof_fn() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("proof fn p(x: nat) -> bool ensures true, { x > 0 }");
+        assert_flagged(&a, &b, "spec → proof conversion (deletes a spec fn)");
+    }
+
+    #[test]
+    fn cheat_spec_fn_converted_to_exec_fn() {
+        let a = vwrap("spec fn p(x: nat) -> bool { x > 0 }");
+        let b = vwrap("fn p(x: u32) -> bool { x > 0 }");
+        assert_flagged(&a, &b, "spec → exec conversion");
+    }
+
+    #[test]
+    fn cheat_proof_fn_converted_to_spec_fn() {
+        // file1: proof fn `lem`. file2: spec fn `lem` (no proof fn `lem`).
+        // Helper logic only filters proof fns from file2; the spec fn `lem`
+        // remains and the deleted proof fn `lem` shows up as a diff.
+        let a = vwrap("proof fn lem(x: nat) ensures x >= 0, { }");
+        let b = vwrap("spec fn lem(x: nat) -> bool { x >= 0 }");
+        assert_flagged(&a, &b, "proof → spec conversion");
+    }
+
+    #[test]
+    fn cheat_exec_fn_converted_to_proof_fn() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("proof fn foo(x: u32) -> u32 ensures true, { x }");
+        assert_flagged(&a, &b, "exec → proof conversion (loses exec body and creates new proof fn)");
+    }
+
+    // ── Rule 5: adding a proof helper IS allowed ───────────────────────
+
+    #[test]
+    fn allowed_add_top_level_proof_helper() {
+        let a = vwrap(
+            "proof fn equiv(x: nat) ensures x >= 0, { }",
+        );
+        let b = vwrap(
+            "proof fn equiv(x: nat) ensures x >= 0, { helper(x); }\n\
+             proof fn helper(x: nat) ensures true, { }",
+        );
+        assert_equal(&a, &b, "model added a helper proof fn");
+    }
+
+    #[test]
+    fn allowed_add_multiple_proof_helpers() {
+        let a = vwrap("proof fn equiv(x: nat) ensures x >= 0, { }");
+        let b = vwrap(
+            "proof fn equiv(x: nat) ensures x >= 0, { h1(x); h2(x); h3(x); }\n\
+             proof fn h1(x: nat) ensures true, { }\n\
+             proof fn h2(x: nat) ensures true, { }\n\
+             proof fn h3(x: nat) ensures true, { }",
+        );
+        assert_equal(&a, &b, "model added multiple helper proof fns");
+    }
+
+    #[test]
+    fn allowed_add_proof_axiom_helper() {
+        let a = vwrap("proof fn equiv(x: nat) ensures x >= 0, { }");
+        let b = vwrap(
+            "proof fn equiv(x: nat) ensures x >= 0, { helper_axiom(x); }\n\
+             #[verifier::external_body]\n\
+             proof fn helper_axiom(x: nat) ensures true, { }",
+        );
+        assert_equal(&a, &b, "model added a proof axiom helper");
+    }
+
+    #[test]
+    fn allowed_add_impl_proof_helper() {
+        let a = vwrap(
+            "struct S { x: u32 }\n\
+             impl S {\n\
+                 proof fn lem(&self) ensures self.x >= 0, { }\n\
+             }",
+        );
+        let b = vwrap(
+            "struct S { x: u32 }\n\
+             impl S {\n\
+                 proof fn lem(&self) ensures self.x >= 0, { self.helper(); }\n\
+                 proof fn helper(&self) ensures true, { }\n\
+             }",
+        );
+        assert_equal(&a, &b, "model added an impl-method proof helper");
+    }
+
+    // ── Rule 4: proof bodies can change freely ─────────────────────────
+
+    #[test]
+    fn allowed_proof_fn_body_filled_in() {
+        let a = vwrap("proof fn lem(x: nat) ensures x + 0 == x, { }");
+        let b = vwrap("proof fn lem(x: nat) ensures x + 0 == x, { assert(x + 0 == x); }");
+        assert_equal(&a, &b, "model filled in proof body");
+    }
+
+    #[test]
+    fn allowed_proof_fn_body_uses_existing_lemma() {
+        let a = vwrap(
+            "proof fn other(x: nat) ensures true, { }\n\
+             proof fn lem(x: nat) ensures x + 0 == x, { }",
+        );
+        let b = vwrap(
+            "proof fn other(x: nat) ensures true, { }\n\
+             proof fn lem(x: nat) ensures x + 0 == x, { other(x); assert(x + 0 == x); }",
+        );
+        assert_equal(&a, &b, "proof body uses an existing lemma");
+    }
+
+    #[test]
+    fn allowed_assert_in_exec_body() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { assert(x == x); x }");
+        assert_equal(&a, &b, "added assert in exec body");
+    }
+
+    #[test]
+    fn allowed_assume_in_exec_body() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { assume(x > 0); x }");
+        assert_equal(&a, &b, "added assume in exec body");
+    }
+
+    #[test]
+    fn allowed_proof_block_in_exec_body() {
+        let a = vwrap("fn foo(x: u32) -> u32 { x }");
+        let b = vwrap("fn foo(x: u32) -> u32 { proof { assert(x == x); } x }");
+        assert_equal(&a, &b, "added proof { } block in exec body");
+    }
+
+    #[test]
+    fn allowed_added_loop_invariant() {
+        let a = vwrap(
+            "fn sum(n: u32) -> u32 {\n\
+                let mut i: u32 = 0;\n\
+                while i < n decreases n - i { i += 1; }\n\
+                i\n\
+             }",
+        );
+        let b = vwrap(
+            "fn sum(n: u32) -> u32 {\n\
+                let mut i: u32 = 0;\n\
+                while i < n invariant i <= n, decreases n - i { i += 1; }\n\
+                i\n\
+             }",
+        );
+        assert_equal(&a, &b, "model added loop invariants");
+    }
+
+    #[test]
+    fn allowed_strengthened_loop_invariant() {
+        let a = vwrap(
+            "fn sum(n: u32) -> u32 {\n\
+                let mut i: u32 = 0;\n\
+                while i < n invariant i <= n, decreases n - i { i += 1; }\n\
+                i\n\
+             }",
+        );
+        let b = vwrap(
+            "fn sum(n: u32) -> u32 {\n\
+                let mut i: u32 = 0;\n\
+                while i < n invariant i <= n, i >= 0, decreases n - i { i += 1; }\n\
+                i\n\
+             }",
+        );
+        assert_equal(&a, &b, "model strengthened loop invariant");
+    }
+
+    #[test]
+    fn allowed_added_assert_forall_block() {
+        let a = vwrap("proof fn lem() ensures true, { }");
+        let b = vwrap(
+            "proof fn lem() ensures true, {\n\
+                assert forall|x: nat| x + 0 == x by { }\n\
+             }",
+        );
+        assert_equal(&a, &b, "added assert forall in proof body");
+    }
+
+    // ── Aggregated realistic harness mirroring the bug-report file ─────
+
+    const HARNESS: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn all_gt(s: Seq<i32>, k: i32) -> bool {
+        forall|i: int| 0 <= i < s.len() ==> s[i] > k
+    }
+
+    spec fn filter_requires(list: Vec<i32>) -> bool {
+        all_gt(list@, 10)
+    }
+
+    spec fn filter_ensures(list: Vec<i32>, ret: Vec<i32>) -> bool {
+        ret@.len() <= list@.len() && all_gt(ret@, 20)
+    }
+
+    fn filter_gt_20(list: Vec<i32>) -> (ret: Vec<i32>)
+        requires filter_requires(list),
+        ensures filter_ensures(list, ret),
+    {
+        let mut result: Vec<i32> = Vec::new();
+        let mut i: usize = 0;
+        while i < list.len()
+            invariant i <= list.len(), result@.len() <= i, all_gt(result@, 20),
+            decreases list.len() - i,
+        {
+            let x = list[i];
+            if x > 20 { result.push(x); }
+            i += 1;
+        }
+        result
+    }
+
+    proof fn equiv_filter_requires(list: Vec<i32>)
+        ensures filter_requires(list) =~= filter_requires(list),
+    { }
+
+    proof fn equiv_filter_ensures(list: Vec<i32>, ret: Vec<i32>)
+        ensures filter_ensures(list, ret) =~= filter_ensures(list, ret),
+    { }
+
+    proof fn equiv_all_gt(s: Seq<i32>, k: i32)
+        ensures all_gt(s, k) =~= all_gt(s, k),
+    { }
+}
+"#;
+
+    /// Apply a textual modification to HARNESS and assert it is flagged.
+    fn assert_harness_modification_flagged(needle: &str, replacement: &str, msg: &str) {
+        let modified = HARNESS.replace(needle, replacement);
+        assert_ne!(HARNESS, modified, "test bug: replacement had no effect ({msg})");
+        assert_flagged(HARNESS, &modified, msg);
+    }
+
+    fn assert_harness_modification_equal(needle: &str, replacement: &str, msg: &str) {
+        let modified = HARNESS.replace(needle, replacement);
+        assert_ne!(HARNESS, modified, "test bug: replacement had no effect ({msg})");
+        assert_equal(HARNESS, &modified, msg);
+    }
+
+    #[test]
+    fn harness_unchanged_is_equal() {
+        assert_equal(HARNESS, HARNESS, "identical files");
+    }
+
+    #[test]
+    fn harness_proof_body_filled_in_is_equal() {
+        // Fill in an existing lemma's proof body.
+        let needle = "proof fn equiv_all_gt(s: Seq<i32>, k: i32)\n        ensures all_gt(s, k) =~= all_gt(s, k),\n    { }";
+        let replacement = "proof fn equiv_all_gt(s: Seq<i32>, k: i32)\n        ensures all_gt(s, k) =~= all_gt(s, k),\n    {\n        assert(all_gt(s, k) =~= all_gt(s, k));\n    }";
+        assert_harness_modification_equal(needle, replacement, "fill in existing proof body");
+    }
+
+    #[test]
+    fn harness_added_helper_lemma_is_equal() {
+        // Add a brand-new proof helper at the bottom of the verus! block.
+        let needle = "proof fn equiv_all_gt(s: Seq<i32>, k: i32)\n        ensures all_gt(s, k) =~= all_gt(s, k),\n    { }\n}";
+        let replacement = "proof fn equiv_all_gt(s: Seq<i32>, k: i32)\n        ensures all_gt(s, k) =~= all_gt(s, k),\n    { }\n\n    proof fn helper_pushed(s: Seq<i32>, k: i32, x: i32)\n        requires all_gt(s, k), x > k,\n        ensures all_gt(s.push(x), k),\n    { }\n}";
+        let modified = HARNESS.replace(needle, replacement);
+        assert_ne!(HARNESS, modified, "test bug: replacement had no effect");
+        assert_equal(HARNESS, &modified, "added a brand-new proof helper");
+    }
+
+    #[test]
+    fn harness_loop_invariant_relaxed_is_equal() {
+        // Loop invariants are proof scaffolding, free to change.
+        assert_harness_modification_equal(
+            "invariant i <= list.len(), result@.len() <= i, all_gt(result@, 20),",
+            "invariant i <= list.len(), all_gt(result@, 20),",
+            "loop invariant change",
+        );
+    }
+
+    // Forbidden modifications on the harness ─────────────────────────────
+
+    #[test]
+    fn harness_spec_fn_body_change_flagged() {
+        assert_harness_modification_flagged(
+            "fn all_gt(s: Seq<i32>, k: i32) -> bool {\n        forall|i: int| 0 <= i < s.len() ==> s[i] > k\n    }",
+            "fn all_gt(s: Seq<i32>, k: i32) -> bool {\n        true\n    }",
+            "spec fn body weakened to true",
+        );
+    }
+
+    #[test]
+    fn harness_spec_fn_helper_added_flagged() {
+        let modified = HARNESS.replace(
+            "spec fn all_gt(s: Seq<i32>, k: i32) -> bool {",
+            "spec fn extra_spec(x: nat) -> bool { true }\n\n    spec fn all_gt(s: Seq<i32>, k: i32) -> bool {",
+        );
+        assert_flagged(HARNESS, &modified, "model added a new spec fn helper (forbidden)");
+    }
+
+    #[test]
+    fn harness_exec_body_change_flagged() {
+        assert_harness_modification_flagged(
+            "if x > 20 { result.push(x); }",
+            "if x > 30 { result.push(x); }",
+            "exec body change",
+        );
+    }
+
+    #[test]
+    fn harness_exec_ensures_weakened_flagged() {
+        assert_harness_modification_flagged(
+            "ensures filter_ensures(list, ret),",
+            "ensures true,",
+            "exec ensures weakened",
+        );
+    }
+
+    #[test]
+    fn harness_exec_requires_weakened_flagged() {
+        assert_harness_modification_flagged(
+            "requires filter_requires(list),",
+            "requires true,",
+            "exec requires weakened",
+        );
+    }
+
+    #[test]
+    fn harness_proof_ensures_weakened_flagged() {
+        // The exact bug pattern from the original report.
+        assert_harness_modification_flagged(
+            "ensures all_gt(s, k) =~= all_gt(s, k),\n    { }",
+            "ensures true,\n    { }",
+            "proof fn ensures weakened to true (original bug pattern)",
+        );
+    }
+
+    #[test]
+    fn harness_proof_fn_renamed_flagged() {
+        // Rename equiv_all_gt -> equiv_all_gt_v2.
+        let modified = HARNESS.replace("equiv_all_gt", "equiv_all_gt_v2");
+        assert_flagged(HARNESS, &modified, "renaming an existing proof fn");
+    }
+
+    #[test]
+    fn harness_proof_fn_deleted_flagged() {
+        let needle = "proof fn equiv_all_gt(s: Seq<i32>, k: i32)\n        ensures all_gt(s, k) =~= all_gt(s, k),\n    { }\n";
+        let modified = HARNESS.replace(needle, "");
+        assert_ne!(HARNESS, modified, "test bug: replacement had no effect");
+        assert_flagged(HARNESS, &modified, "model deleted an existing proof fn");
+    }
+
+    #[test]
+    fn harness_struct_changes_caught() {
+        // Struct changes: caught (data layout is part of the spec surface).
+        let a = vwrap("struct S { x: u32 }\n    fn f(s: S) -> u32 { s.x }");
+        let b = vwrap("struct S { x: u64 }\n    fn f(s: S) -> u64 { s.x }");
+        assert_flagged(&a, &b, "struct field type change");
+    }
+
+    #[test]
+    fn harness_use_statement_change_caught() {
+        // Adding/removing a `use` is caught.
+        let a = vwrap("fn foo() {}");
+        let b = format!(
+            "use std::collections::HashMap;\n{}",
+            vwrap("fn foo() {}")
+        );
+        assert_flagged(&a, &b, "added `use` statement");
+    }
+
+    // ── Loop-level decreases / loop_ensures: proof-mode constructs ──────
+    //
+    // The masking pipeline (create_masked_segments.py) blanks all
+    // `decreases` and loop-level `ensures` clauses in proof-mode masks and
+    // expects the model to fill them back in. For
+    // `compare --spec-mode --allow-helpers` to verify those completions
+    // without false positives, loop `decreases` and `loop_ensures` must
+    // be treated as proof-mode (stripped). A fn-signature `decreases`,
+    // however, is part of the spec and MUST still be enforced.
+
+    const LOOP_BASE: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    fn count_up(n: u64) -> (r: u64)
+        ensures r == n,
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant
+                i <= n,
+            ensures
+                i == n,
+            decreases n - i,
+        {
+            i = i + 1;
+        }
+        i
+    }
+}
+"#;
+
+    #[test]
+    fn allowed_model_fills_in_loop_decreases() {
+        // Input has a placeholder (no decreases); model fills it in.
+        let masked = LOOP_BASE.replace("            decreases n - i,\n", "");
+        assert_equal(&masked, LOOP_BASE, "model added a loop decreases (proof-mode artifact)");
+    }
+
+    #[test]
+    fn allowed_model_changes_loop_decreases_expression() {
+        let modified = LOOP_BASE.replace("decreases n - i,", "decreases (n - i) as int,");
+        assert_equal(LOOP_BASE, &modified, "model picked a different termination measure");
+    }
+
+    #[test]
+    fn allowed_model_fills_in_loop_ensures() {
+        // Loop-level ensures (loop_ensures) is a proof-mode artifact.
+        let masked = LOOP_BASE.replace("            ensures\n                i == n,\n", "");
+        assert_equal(&masked, LOOP_BASE, "model added a loop_ensures clause");
+    }
+
+    #[test]
+    fn allowed_model_changes_loop_ensures() {
+        let modified = LOOP_BASE.replace("ensures\n                i == n,", "ensures\n                i >= n,");
+        assert_equal(LOOP_BASE, &modified, "model strengthened loop_ensures");
+    }
+
+    #[test]
+    fn allowed_loop_invariant_change_via_spec_mode_allow_helpers() {
+        // Sanity: loop invariants are also proof-mode.
+        let modified = LOOP_BASE.replace("invariant\n                i <= n,", "invariant\n                i <= n, true,");
+        assert_equal(LOOP_BASE, &modified, "model added a loop invariant");
+    }
+
+    const RECURSIVE_BASE: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn fact(n: nat) -> nat
+        decreases n,
+    {
+        if n == 0 { 1 } else { n * fact((n - 1) as nat) }
+    }
+}
+"#;
+
+    #[test]
+    fn allowed_fn_sig_decreases_removed() {
+        // Unified rule: signature `decreases` is termination scaffolding,
+        // not part of the spec for `compare --spec-mode --allow-helpers`.
+        // The masker blanks it per-mode, so the verifier must accept it.
+        let modified = RECURSIVE_BASE.replace("        decreases n,\n", "");
+        assert_equal(RECURSIVE_BASE, &modified, "removing fn-sig decreases is allowed");
+    }
+
+    #[test]
+    fn allowed_fn_sig_decreases_changed() {
+        let modified =
+            RECURSIVE_BASE.replace("        decreases n,\n", "        decreases 0nat,\n");
+        assert_equal(RECURSIVE_BASE, &modified, "changing fn-sig decreases is allowed");
+    }
+
+    #[test]
+    fn cheat_fn_sig_ensures_unchanged_by_loop_changes() {
+        // Confirm fn-sig ensures is still enforced even though loop_ensures is not.
+        let modified = LOOP_BASE.replace("ensures r == n,", "ensures true,");
+        assert_flagged(LOOP_BASE, &modified, "weakened fn-sig ensures (not a loop_ensures)");
+    }
+
+    // End-to-end with the masking-pipeline pattern: a single file with a
+    // recursive fn (sig decreases — must be enforced) AND a loop with
+    // decreases+ensures (must be free for the model to fill in).
+    const MIXED_BASE: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    spec fn fact(n: nat) -> nat
+        decreases n,
+    {
+        if n == 0 { 1 } else { n * fact((n - 1) as nat) }
+    }
+
+    fn count_up(n: u64) -> (r: u64)
+        ensures r == n,
+    {
+        let mut i: u64 = 0;
+        while i < n
+            invariant i <= n,
+            ensures i == n,
+            decreases n - i,
+        {
+            i = i + 1;
+        }
+        i
+    }
+}
+"#;
+
+    #[test]
+    fn allowed_mixed_loop_proof_artifacts_filled_in() {
+        // Simulate the proof-mode mask: blank loop decreases + loop_ensures
+        // + invariants. The model fills them all back in.
+        let masked = MIXED_BASE
+            .replace("            invariant i <= n,\n", "")
+            .replace("            ensures i == n,\n", "")
+            .replace("            decreases n - i,\n", "");
+        assert_equal(&masked, MIXED_BASE, "mixed: loop proof artifacts filled in");
+    }
+
+    #[test]
+    fn allowed_mixed_fn_sig_decreases_removed() {
+        // In the same mixed file, removing fn-sig decreases on the
+        // recursive spec_fn is also allowed under the unified rule.
+        let modified = MIXED_BASE.replace("        decreases n,\n", "");
+        assert_equal(MIXED_BASE, &modified, "mixed: removing recursive fn-sig decreases is allowed");
     }
 }

@@ -521,8 +521,9 @@ lynette compare [OPTIONS] <FILE1> <FILE2>
 | Flag | Description |
 |---|---|
 | `-t, --target` | *(Deprecated)* Enables `--requires --ensures --assumes --decreases` together |
-| `--spec-mode` | Enable all spec-related flags (`--spec --requires --ensures --recommends --decreases`) |
+| `--spec-mode` | Enable all spec-related flags (`--spec --requires --ensures --recommends`). **Note**: signature-level `decreases` is NOT enabled here — it is treated as termination scaffolding and ignored on every fn kind. Pass `--decreases` explicitly to enforce it. |
 | `--proof-mode` | Enable all proof-related flags (`--proof --invariants --asserts --assert-forall --assumes --proof-block`) |
+| `--allow-helpers` | When used with `--spec-mode`, ignore *new* proof-fn helpers that `<FILE2>` introduces but that are not present in `<FILE1>`. Directional: `<FILE1>` is the original/spec-defining file and `<FILE2>` the candidate (e.g. a model-generated proof completion). Renaming or deleting an existing proof fn is therefore detected. No-op outside `--spec-mode`. |
 | `--requires` | Also compare `requires` clauses |
 | `--ensures` | Also compare `ensures` clauses |
 | `--recommends` | Also compare `recommends` clauses |
@@ -544,10 +545,38 @@ The flags map to these Verus constructs:
 | Category | Kinds | Flags |
 |---|---|---|
 | **Spec function kinds** | `spec fn`, `spec(checked) fn` | `--spec` (or `--spec-mode`) |
-| **Spec clause kinds** | `requires`, `ensures`, `recommends`, `decreases` | `--requires`, `--ensures`, `--recommends`, `--decreases` (or `--spec-mode`) |
+| **Spec clause kinds** | `requires`, `ensures`, `recommends` | `--requires`, `--ensures`, `--recommends` (or `--spec-mode`) |
+| **Decreases (termination scaffolding)** | `decreases` (signature-level on any fn kind) | `--decreases` only \u2014 *not* enabled by `--spec-mode` or `--proof-mode`. Loop-level `decreases` is gated by `--invariants` (or `--proof-mode`). |
 | **Proof function kinds** | `proof fn`, `proof(axiom) fn` | `--proof` (or `--proof-mode`) |
 | **Proof clause kinds** | `invariant`, `invariant_ensures`, `invariant_except_break`, `assert`, `assert forall`, `assume`, `proof { ... }` | `--invariants`, `--asserts`, `--assert-forall`, `--assumes`, `--proof-block` (or `--proof-mode`) |
 | **Exec function kinds** | `exec fn`, `fn` | Always retained (never stripped) |
+
+> **Note on proof functions and spec clauses.** When any spec-clause flag
+> (`--requires`, `--ensures`, `--recommends`, or `--spec-mode`)
+> is enabled but `--proof` is not, the *signatures* of `proof fn` /
+> `proof(axiom) fn` items are preserved (with the enabled clauses) and only
+> the proof body is dropped. Lemma contracts are part of the spec surface,
+> so weakening a lemma's `ensures` will be detected by `--spec-mode`.
+> Use `--proof` (or `--proof-mode`) if you also want to compare proof bodies.
+>
+> **Note on `decreases`.** `decreases` is *termination scaffolding*, not
+> semantic content: two functions with identical bodies but different
+> `decreases` clauses are extensionally equivalent. Accordingly:
+>
+> - **Signature-level `decreases`** (on a `spec fn`, `proof fn`, or `exec fn`)
+>   is stripped under `--spec-mode` and `--proof-mode` and is therefore
+>   never compared. The masking pipeline (`create_masked_segments.py`)
+>   blanks `decreases` per-mode (spec-mode on `spec fn` sigs, proof-mode
+>   on `proof fn` sigs, exec-mode on `exec fn` sigs); the verifier
+>   mirrors that by ignoring all signature `decreases` so blanked +
+>   filled-in completions round-trip cleanly.
+> - **Loop-level `decreases`** (inside `while` / `for` / `loop` headers)
+>   is gated by `--invariants` (set by `--proof-mode`, *not* by
+>   `--spec-mode`). It is therefore stripped under `--spec-mode` and
+>   compared under `--proof-mode`.
+> - To enforce signature `decreases` on every fn kind, pass `--decreases`
+>   explicitly. To enforce loop-level `decreases`, pass `--invariants`
+>   (or `--proof-mode`).
 
 ### Example
 
@@ -564,6 +593,10 @@ lynette compare --spec-mode file1.rs file2.rs
 # Compare with all proof-related ghost code preserved
 lynette compare --proof-mode file1.rs file2.rs
 
+# Compare specs/exec strictly, but allow new proof-fn helpers in file2
+# (typical "model proof completion" check):
+lynette compare --spec-mode --allow-helpers original.rs model_patched.rs
+
 # Compare everything including all ghost code
 lynette compare --spec-mode --proof-mode file1.rs file2.rs
 
@@ -571,6 +604,47 @@ lynette compare --spec-mode --proof-mode file1.rs file2.rs
 lynette compare --spec --proof --requires --ensures --recommends --invariants \
   --asserts --assert-forall --decreases --assumes --proof-block file1.rs file2.rs
 ```
+
+### Proof-writing contract enforced by `--spec-mode --allow-helpers`
+
+This combination is designed for verifying that a model-generated proof
+completion did not tamper with the spec/exec surface of the input file.
+Argument order is significant: pass the original input as `<FILE1>` and the
+model output as `<FILE2>`.
+
+It catches (exits 1):
+
+- spec function body / signature / parameter / return / `recommends` change
+- spec function added or removed
+- `requires` / `ensures` change on any spec, proof, or exec function
+- exec / proof function signature change (rename, params, return, generics,
+  where, visibility, unsafety)
+- exec function body change
+- exec function added or removed
+- proof function present in `<FILE1>` but missing in `<FILE2>`, or renamed
+- conversion between spec / proof / exec function kinds
+- struct / enum / trait declaration changes
+- top-level `use` / `const` / `static` / `mod` changes
+
+It allows (exits 0):
+
+- proof function body change (including filling in an empty stub)
+- new proof function helpers added at the top level or inside `impl` blocks
+  (asymmetric: only NEW names in `<FILE2>` are tolerated; removing or
+  renaming an existing proof fn is still flagged)
+- `assert`, `assert forall`, `assume`, `proof { ... }` blocks added inside
+  any retained function body
+- loop `invariant` / `invariant_ensures` / `invariant_except_break` changes
+  (additions, strengthening, removals)
+- loop-level `decreases` and loop-level `ensures` changes
+- **signature-level `decreases` changes on every fn kind** (spec_fn,
+  proof_fn, exec_fn) — added, removed, or rewritten. Pass `--decreases`
+  explicitly to make these a hard cheat.
+
+**Known limitation.** Verifier attributes (`#[verifier::external_body]`,
+`#[verifier::opaque]`, `#[verifier::external]`, etc.) are stripped before
+comparison and so additions/removals are *not* detected by `compare`.
+Use `lynette additions` to catch attribute-level cheating.
 
 ---
 
