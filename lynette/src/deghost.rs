@@ -31,6 +31,23 @@ fn keep_sig_decreases(_sig_mode: &syn_verus::FnMode, mode: &DeghostMode) -> bool
     mode.decreases
 }
 
+/// Return true when any proof-clause flag is set, i.e. the caller is
+/// running in a proof-mode-active configuration (`lynette compare
+/// --proof-mode` and friends). Used as the dual of the `any_spec_clause`
+/// trigger: when proof-mode is active and we encounter a `spec fn`, we
+/// retain its *signature* (so renames, parameter changes, etc. on
+/// existing spec_fns are detected) but the caller blanks its *body*
+/// (since the spec_fn body was masked out by the spec-mode masker for
+/// the model to fill in).
+fn proof_mode_active(mode: &DeghostMode) -> bool {
+    mode.proof
+        || mode.invariants
+        || mode.asserts
+        || mode.assert_forall
+        || mode.assumes
+        || mode.proof_block
+}
+
 fn remove_ghost_local(local: &syn_verus::Local, mode: &DeghostMode) -> Option<syn_verus::Local> {
     match local.ghost {
         Some(_) => None,
@@ -377,8 +394,18 @@ pub fn remove_ghost_sig(
      * - decreases
      * - invariants
      */
+    // For spec functions: when --spec is off, we normally strip them entirely.
+    // EXCEPTION: when proof-mode is active (any of proof/invariants/asserts/
+    // assert_forall/assumes/proof_block is set), the spec function *signature*
+    // is part of the proof surface (callers in retained proof / exec bodies
+    // reference these names with their parameter and return types). In that
+    // case we retain the signature here and let the caller blank the body
+    // (since the spec_fn body was masked out for the model to fill). This
+    // makes `lynette compare --proof-mode` detect renames/removals of
+    // existing spec_fns while still allowing the body to be rewritten.
     if !mode.spec
         && matches!(sig.mode, syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_))
+        && !proof_mode_active(mode)
     {
         return None;
     }
@@ -506,12 +533,27 @@ fn remove_ghost_fn(func: &syn_verus::ItemFn, mode: &DeghostMode) -> Option<syn_v
             new_sig.mode,
             syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_)
         );
-        if is_spec || (is_proof && mode.proof) {
+        if (is_spec && mode.spec) || (is_proof && mode.proof) {
             Some(syn_verus::ItemFn {
                 attrs: remove_verifier_attr(&func.attrs),
                 vis: func.vis.clone(),
                 sig: new_sig,
                 block: func.block.clone(),
+                semi_token: func.semi_token.clone(),
+            })
+        } else if is_spec {
+            // Spec fn retained under --proof-mode: keep signature (so renames /
+            // parameter / return-type changes on existing spec_fns are detected),
+            // but drop the body since the spec_fn body was masked for the model
+            // to fill in.
+            Some(syn_verus::ItemFn {
+                attrs: remove_verifier_attr(&func.attrs),
+                vis: func.vis.clone(),
+                sig: new_sig,
+                block: Box::new(syn_verus::Block {
+                    brace_token: Default::default(),
+                    stmts: Vec::new(),
+                }),
                 semi_token: func.semi_token.clone(),
             })
         } else if is_proof {
@@ -567,13 +609,27 @@ fn remove_ghost_impl(i: &syn_verus::ItemImpl, mode: &DeghostMode) -> syn_verus::
                                 new_sig.mode,
                                 syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_)
                             );
-                            if is_spec || (is_proof && mode.proof) {
+                            if (is_spec && mode.spec) || (is_proof && mode.proof) {
                                 Some(syn_verus::ImplItemFn {
                                     attrs: func.attrs.clone(),
                                     vis: func.vis.clone(),
                                     defaultness: func.defaultness.clone(),
                                     sig: new_sig,
                                     block: func.block.clone(),
+                                    semi_token: func.semi_token.clone(),
+                                })
+                            } else if is_spec {
+                                // Spec fn retained under --proof-mode: keep
+                                // signature, drop body (masked for model).
+                                Some(syn_verus::ImplItemFn {
+                                    attrs: func.attrs.clone(),
+                                    vis: func.vis.clone(),
+                                    defaultness: func.defaultness.clone(),
+                                    sig: new_sig,
+                                    block: syn_verus::Block {
+                                        brace_token: Default::default(),
+                                        stmts: Vec::new(),
+                                    },
                                     semi_token: func.semi_token.clone(),
                                 })
                             } else if is_proof {
@@ -637,15 +693,36 @@ fn remove_ghost_item(item: &syn_verus::Item, mode: &DeghostMode) -> Option<syn_v
                 .iter()
                 .filter_map(|i| match i {
                     syn_verus::TraitItem::Fn(func) => {
-                        Some(syn_verus::TraitItem::Fn(TraitItemFn {
-                            attrs: func.attrs.clone(),
-                            sig: remove_ghost_sig(&func.sig, mode)?,
-                            default: func.default.as_ref().map(|b| {
+                        let new_sig = remove_ghost_sig(&func.sig, mode)?;
+                        let is_spec_kept_for_proof_mode = matches!(
+                            new_sig.mode,
+                            syn_verus::FnMode::Spec(_) | syn_verus::FnMode::SpecChecked(_)
+                        ) && !mode.spec;
+                        let is_proof_kept_for_spec_mode = matches!(
+                            new_sig.mode,
+                            syn_verus::FnMode::Proof(_) | syn_verus::FnMode::ProofAxiom(_)
+                        ) && !mode.proof;
+                        let default_block = if is_spec_kept_for_proof_mode
+                            || is_proof_kept_for_spec_mode
+                        {
+                            // Body was masked for the model — blank it on both
+                            // sides so it doesn't contribute to the diff.
+                            func.default.as_ref().map(|_| syn_verus::Block {
+                                brace_token: Default::default(),
+                                stmts: Vec::new(),
+                            })
+                        } else {
+                            func.default.as_ref().map(|b| {
                                 remove_ghost_block(b, mode).unwrap_or_else(|| syn_verus::Block {
                                     brace_token: Default::default(),
                                     stmts: Vec::new(),
                                 })
-                            }),
+                            })
+                        };
+                        Some(syn_verus::TraitItem::Fn(TraitItemFn {
+                            attrs: func.attrs.clone(),
+                            sig: new_sig,
+                            default: default_block,
                             semi_token: func.semi_token.clone(),
                         }))
                     }

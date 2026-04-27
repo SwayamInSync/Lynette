@@ -608,6 +608,8 @@ fn compare_files(args: &CompareArgs) -> Result<bool, Error> {
         fextract_pure_rust(f2, &mode).and_then(|result2| {
             let (result1, result2) = if args.allow_helpers && args.spec_mode {
                 strip_proof_fn_helpers(result1, result2)
+            } else if args.allow_helpers && args.proof_mode {
+                strip_spec_fn_helpers(result1, result2)
             } else {
                 (result1, result2)
             };
@@ -706,6 +708,96 @@ fn strip_proof_fn_helpers(
 ) -> (syn_verus::File, syn_verus::File) {
     let names1 = collect_proof_fn_names(&f1);
     (f1, drop_proof_fns_not_in(f2, &names1))
+}
+
+/// Collect spec-fn names defined at the top level or inside `impl` blocks of
+/// a (deghosted) file. Top-level spec fns are keyed by their identifier;
+/// `impl`-bound spec fns are keyed by `<self_ty>::<method>` so methods on
+/// different types don't collide. Mirror of `collect_proof_fn_names`.
+fn collect_spec_fn_names(file: &syn_verus::File) -> std::collections::HashSet<String> {
+    use syn_verus::FnMode;
+    fn is_spec(mode: &FnMode) -> bool {
+        matches!(mode, FnMode::Spec(_) | FnMode::SpecChecked(_))
+    }
+    let mut names = std::collections::HashSet::new();
+    for item in &file.items {
+        match item {
+            syn_verus::Item::Fn(f) if is_spec(&f.sig.mode) => {
+                names.insert(f.sig.ident.to_string());
+            }
+            syn_verus::Item::Impl(i) => {
+                let self_ty = i.self_ty.to_token_stream().to_string();
+                for ii in &i.items {
+                    if let syn_verus::ImplItem::Fn(m) = ii {
+                        if is_spec(&m.sig.mode) {
+                            names.insert(format!("{}::{}", self_ty, m.sig.ident));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Drop from `file` any spec fn whose name does not appear in `keep`. Mirror
+/// of `drop_proof_fns_not_in`.
+fn drop_spec_fns_not_in(
+    file: syn_verus::File,
+    keep: &std::collections::HashSet<String>,
+) -> syn_verus::File {
+    use syn_verus::FnMode;
+    fn is_spec(mode: &FnMode) -> bool {
+        matches!(mode, FnMode::Spec(_) | FnMode::SpecChecked(_))
+    }
+    let new_items = file
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            syn_verus::Item::Fn(ref f) if is_spec(&f.sig.mode) => {
+                if keep.contains(&f.sig.ident.to_string()) {
+                    Some(item)
+                } else {
+                    None
+                }
+            }
+            syn_verus::Item::Impl(mut i) => {
+                let self_ty = i.self_ty.to_token_stream().to_string();
+                i.items.retain(|ii| match ii {
+                    syn_verus::ImplItem::Fn(m) if is_spec(&m.sig.mode) => {
+                        keep.contains(&format!("{}::{}", self_ty, m.sig.ident))
+                    }
+                    _ => true,
+                });
+                Some(syn_verus::Item::Impl(i))
+            }
+            _ => Some(item),
+        })
+        .collect();
+    syn_verus::File {
+        shebang: file.shebang,
+        attrs: file.attrs,
+        items: new_items,
+    }
+}
+
+/// Asymmetric pass for `--allow-helpers --proof-mode`. Treats `f1` as the
+/// original file and `f2` as the candidate (model output). Drops from `f2`
+/// any spec fn whose name is not in `f1`; `f1` is left untouched.
+///  * new spec helpers in `f2` are ignored (allowed),
+///  * removed/renamed spec fns from `f1` produce a diff (forbidden).
+///
+/// Spec fns present in both are kept on both sides; under `--proof-mode`
+/// `remove_ghost_fn` retains their signatures with bodies blanked, so a
+/// rename / parameter-change / return-type-change is still detected while a
+/// body rewrite is allowed.
+fn strip_spec_fn_helpers(
+    f1: syn_verus::File,
+    f2: syn_verus::File,
+) -> (syn_verus::File, syn_verus::File) {
+    let names1 = collect_spec_fn_names(&f1);
+    (f1, drop_spec_fns_not_in(f2, &names1))
 }
 
 // Borrowed and modified from syn/src/item.rs
