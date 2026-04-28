@@ -730,7 +730,7 @@ fn remove_ghost_item(item: &syn_verus::Item, mode: &DeghostMode) -> Option<syn_v
                 })
                 .collect::<Vec<syn_verus::TraitItem>>(),
         })),
-in others        syn_verus::Item::Mod(m) => Some(syn_verus::Item::Mod(syn_verus::ItemMod {
+        syn_verus::Item::Mod(m) => Some(syn_verus::Item::Mod(syn_verus::ItemMod {
             attrs: m.attrs.clone(),
             vis: m.vis.clone(),
             unsafety: m.unsafety.clone(),
