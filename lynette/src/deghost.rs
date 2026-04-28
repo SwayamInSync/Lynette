@@ -730,8 +730,24 @@ fn remove_ghost_item(item: &syn_verus::Item, mode: &DeghostMode) -> Option<syn_v
                 })
                 .collect::<Vec<syn_verus::TraitItem>>(),
         })),
+        syn_verus::Item::Mod(m) => Some(syn_verus::Item::Mod(syn_verus::ItemMod {
+            attrs: m.attrs.clone(),
+            vis: m.vis.clone(),
+            unsafety: m.unsafety.clone(),
+            mod_token: m.mod_token.clone(),
+            ident: m.ident.clone(),
+            content: m.content.as_ref().map(|(brace, items)| {
+                (
+                    brace.clone(),
+                    items
+                        .iter()
+                        .filter_map(|i| remove_ghost_item(i, mode))
+                        .collect(),
+                )
+            }),
+            semi: m.semi.clone(),
+        })),
         _ => Some(item.clone()), // syn_verus::Item::Macro(m) => visit_macro(m),
-                                 // syn_verus::Item::Mod(m) => visit_mod(m),
                                  // syn_verus::Item::Use(u) => visit_use(u),
                                  // syn_verus::Item::Struct(s) => visit_struct(s),
                                  // syn_verus::Item::Enum(e) => visit_enum(e),
@@ -2946,5 +2962,106 @@ verus! {
         // than removed. Still ignored by the verifier.
         let modified = RECURSIVE_FN_WITH_SIG_DECREASES.replace("decreases n,", "decreases 0nat,");
         assert_spec_mode_eq(RECURSIVE_FN_WITH_SIG_DECREASES, &modified);
+    }
+
+    // ── Item::Mod traversal ────────────────────────────────────────────
+
+    const MOD_WITH_GHOST: &str = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    pub mod inner {
+        use vstd::prelude::*;
+        pub spec fn s(n: int) -> int { n + 1 }
+        pub proof fn p(n: int) ensures s(n) == n + 1 { }
+        pub fn e(n: u64) -> u64
+            requires n < 100,
+            ensures true,
+        {
+            assert(n < 100);
+            n + 1
+        }
+    }
+}
+"#;
+
+    #[test]
+    fn mod_spec_mode_changes_inside_proof_fn_body_ignored() {
+        // Changing the body of a proof_fn nested inside a `mod` must
+        // not affect spec-mode equality.
+        let modified = MOD_WITH_GHOST.replace(
+            "pub proof fn p(n: int) ensures s(n) == n + 1 { }",
+            "pub proof fn p(n: int) ensures s(n) == n + 1 { assert(s(n) == n + 1); }",
+        );
+        assert_ne!(MOD_WITH_GHOST, modified);
+        assert_spec_mode_eq(MOD_WITH_GHOST, &modified);
+    }
+
+    #[test]
+    fn mod_spec_mode_detects_exec_body_change_inside_mod() {
+        // Changing exec body inside a `mod` MUST be detected.
+        let modified = MOD_WITH_GHOST.replace("n + 1\n        }", "n + 2\n        }");
+        assert_ne!(MOD_WITH_GHOST, modified);
+        assert_spec_mode_ne(MOD_WITH_GHOST, &modified);
+    }
+
+    #[test]
+    fn mod_spec_mode_detects_spec_body_change_inside_mod() {
+        // Changing spec_fn body inside a `mod` MUST be detected
+        // (spec-mode keeps spec_fn bodies).
+        let modified = MOD_WITH_GHOST.replace(
+            "pub spec fn s(n: int) -> int { n + 1 }",
+            "pub spec fn s(n: int) -> int { n + 2 }",
+        );
+        assert_ne!(MOD_WITH_GHOST, modified);
+        assert_spec_mode_ne(MOD_WITH_GHOST, &modified);
+    }
+
+    #[test]
+    fn mod_default_mode_strips_ghost_inside_mod() {
+        let out = deghost(MOD_WITH_GHOST, &DeghostMode::default());
+        // Ghost items inside the nested `mod` must be stripped.
+        assert!(!out.contains("proof fn p"), "proof fn leaked: {}", out);
+        assert!(!out.contains("spec fn s"), "spec fn leaked: {}", out);
+        assert!(!out.contains("requires"), "requires leaked: {}", out);
+        assert!(!out.contains("ensures"), "ensures leaked: {}", out);
+        assert!(!out.contains("assert("), "assert leaked: {}", out);
+        // Exec fn inside mod must remain.
+        assert!(out.contains("fn e"), "exec fn lost: {}", out);
+    }
+
+    #[test]
+    fn mod_nested_mod_is_traversed() {
+        let nested = r#"
+use vstd::prelude::*;
+fn main() {}
+verus! {
+    pub mod outer {
+        pub mod inner {
+            pub spec fn s(n: int) -> int { n + 1 }
+            pub fn e(n: u64) -> u64 { n + 1 }
+        }
+    }
+}
+"#;
+        let out = deghost(nested, &DeghostMode::default());
+        assert!(!out.contains("spec fn s"), "nested spec fn leaked: {}", out);
+        assert!(out.contains("fn e"), "nested exec fn lost: {}", out);
+    }
+
+    #[test]
+    fn mod_extern_without_body_preserved() {
+        // `mod foo;` (no body) must round-trip without panicking.
+        let src = r#"
+use vstd::prelude::*;
+fn main() {}
+mod other;
+verus! {
+    pub fn e(n: u64) -> u64 { n + 1 }
+}
+"#;
+        let out = deghost(src, &DeghostMode::default());
+        assert!(out.contains("mod other"), "extern mod lost: {}", out);
+        assert!(out.contains("fn e"));
     }
 }
