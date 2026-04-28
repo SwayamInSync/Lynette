@@ -614,8 +614,11 @@ fn compare_files(args: &CompareArgs) -> Result<bool, Error> {
                 (result1, result2)
             };
             if args.verbose {
+                println!("===== LYNETTE_FILE1 =====");
                 println!("{}", fprint_file(&result1, Formatter::VerusFmt));
+                println!("===== LYNETTE_FILE2 =====");
                 println!("{}", fprint_file(&result2, Formatter::VerusFmt));
+                println!("===== LYNETTE_END =====");
             }
             Ok(result1 == result2)
         })
