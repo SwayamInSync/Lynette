@@ -16,11 +16,13 @@ use syn::spanned::Spanned;
 
 use crate::utils::{fload_file, Error};
 
-const TODO: &str = "// TODO fill here";
-/// Block-comment form of the placeholder, used in inline contexts (e.g. on the
-/// same line as a `const NAME: T = <expr>;` semicolon) where a `//` line
-/// comment would swallow the rest of the line.
-const TODO_INLINE: &str = "/* TODO fill here */";
+/// Placeholder text inserted in place of erased bodies. Empty by design:
+/// downstream consumers (LLMs being prompted with the skeleton) infer fill
+/// points from the surrounding structure rather than from a marker comment.
+const TODO: &str = "";
+/// Inline-context placeholder (e.g. on the right-hand side of a
+/// `const NAME: T = <expr>;`). Also empty.
+const TODO_INLINE: &str = "";
 
 #[derive(Debug, Clone)]
 struct Replacement {
@@ -40,17 +42,14 @@ fn span_loc(s: proc_macro2::Span) -> ((usize, usize), (usize, usize)) {
     ((st.line, st.column), (en.line, en.column))
 }
 
-fn brace_replacement(span: proc_macro2::Span, outer_col: usize) -> Replacement {
-    // Replace `{ ... }` (including the braces) with a freshly indented block
-    // containing the TODO comment. `outer_col` is the indent of the enclosing
-    // item (e.g. the column of the `fn`/`struct`/`impl` keyword).
+fn brace_replacement(span: proc_macro2::Span, _outer_col: usize) -> Replacement {
+    // Replace `{ ... }` (including the braces) with empty braces. The model
+    // figures out where to fill in from the surrounding structure.
     let ((sl, sc), (el, ec)) = span_loc(span);
-    let outer_indent = " ".repeat(outer_col);
-    let inner_indent = " ".repeat(outer_col + 4);
     Replacement {
         start: (sl, sc),
         end: (el, ec),
-        text: format!("{{\n{}{}\n{}}}", inner_indent, TODO, outer_indent),
+        text: "{}".to_string(),
         eat_trailing_comma: false,
     }
 }
