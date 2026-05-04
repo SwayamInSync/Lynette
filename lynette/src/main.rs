@@ -312,7 +312,11 @@ struct FunctionArgs {
 #[derive(Args)]
 struct ExtractFunctionArgs {
     file: PathBuf,
-    #[clap(short, long, help = "A list of comma-separated function names.", value_delimiter = ',')]
+    // Function names may contain commas (e.g. tuple-impl methods like
+    // ``(T, U)::is_marshalable``); using ``value_delimiter = ','`` would
+    // split such a name into pieces and prevent lookup. Pass repeated
+    // ``-f`` flags to extract multiple functions instead.
+    #[clap(short, long, help = "A function name. Repeat the flag to extract multiple functions.")]
     function: Vec<String>,
     #[clap(short, help = "Only return the function body.", default_value = "false")]
     body: bool,

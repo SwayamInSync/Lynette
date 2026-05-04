@@ -521,9 +521,56 @@ pub fn method_is_ext_spec(m: &syn_verus::ImplItemFn) -> bool {
 
 pub fn type_path_to_string(t: &syn_verus::Type) -> String {
     if let syn_verus::Type::Path(p) = t {
-        p.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::")
+        // Render each segment with its generic arguments preserved on
+        // the LAST segment so that distinct impls of the same trait on
+        // the same bare type with different type arguments produce
+        // distinct qualified names. Without the args, both
+        // ``impl Marshalable for Vec<u8>`` and
+        // ``impl<T: Marshalable> Marshalable for Vec<T>`` collapse to
+        // ``Vec::is_marshalable``, and the downstream harness pipeline
+        // (which keys spec fn bodies by qualified name) silently drops
+        // one of them.
+        //
+        // Earlier segments keep just their ident — module paths
+        // (``a::b::Vec``) do not carry args at intermediate levels, and
+        // including them would inflate the qualified name with
+        // turbofish noise that downstream regex anchors don't expect.
+        let n = p.path.segments.len();
+        if n == 0 {
+            return String::new();
+        }
+        let mut parts: Vec<String> =
+            p.path.segments.iter().take(n - 1).map(|s| s.ident.to_string()).collect();
+        let last = &p.path.segments[n - 1];
+        match &last.arguments {
+            syn_verus::PathArguments::None => parts.push(last.ident.to_string()),
+            _ => {
+                // Render the LAST segment via the token stream so its
+                // generic args are included (``Vec<u8>``, ``Vec<T>``).
+                // ``last.to_token_stream()`` yields whitespace between
+                // tokens (``Vec < u8 >``); that's fine — the whole
+                // qualified name is opaque to splits on ``::``.
+                let mut ts = TokenStream::new();
+                last.to_tokens(&mut ts);
+                parts.push(ts.to_string());
+            }
+        }
+        parts.join("::")
     } else {
-        String::new()
+        // Non-Path self types: tuples ``(T, U)``, references ``&T``,
+        // arrays ``[T; N]``, slices ``[T]``, raw pointers, etc. Falling
+        // back to the empty string here would collapse all such impls
+        // to a qualified name like ``::method``, making distinct
+        // ``impl Trait for <NonNominal>`` blocks indistinguishable and
+        // preventing the harness pipeline from anchoring an impl-block
+        // lookup on a bare type name. Render via the token stream
+        // (e.g. ``(T , U)``) so the qualified name stays unique and the
+        // downstream owner-type extractor has something to work with.
+        // Whitespace inside type tokens is harmless for `name.split("::")`
+        // because non-Path types do not themselves contain ``::`` at
+        // top level (any nested ``Map::Key`` lives inside ``< >`` of a
+        // surrounding Path, which we do not recurse into here).
+        t.to_token_stream().to_string()
     }
 }
 
